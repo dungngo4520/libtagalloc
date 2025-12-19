@@ -61,6 +61,11 @@ const FLAG_COUNTER_OVERFLOW: u64 = 1 << 1;
 const OVERFLOW_TAG: u32 = 0x3F_3F_3F_3F; // "????"
 
 const BaseCapacity: usize = 1024;
+const SegmentCapacity: usize = 1024;
+
+const ENTRY_EMPTY: u32 = 0;
+const ENTRY_USED: u32 = 1;
+const ENTRY_WRITING: u32 = 2;
 
 const BaseSegment = struct {
     header: AggSegmentV1,
@@ -163,6 +168,112 @@ fn bumpFree(entry: *AggEntryV1, size: usize) void {
     atomicAddSaturating(&entry.free_bytes, @intCast(size));
 }
 
+fn segmentEntriesPtr(seg: *AggSegmentV1) [*]AggEntryV1 {
+    const base = @intFromPtr(seg) + @sizeOf(AggSegmentV1);
+    return @ptrFromInt(base);
+}
+
+fn findInSegment(seg: *AggSegmentV1, tag: u32) ?*AggEntryV1 {
+    const count: usize = @intCast(seg.entry_count);
+    if (count == 0) return null;
+
+    const mask = count - 1;
+    var idx: usize = hashTag(tag) & mask;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const entry = &segmentEntriesPtr(seg)[idx];
+        const state = @atomicLoad(u32, &entry.reserved0, .acquire);
+        if (state == ENTRY_EMPTY) return null;
+        if (state == ENTRY_USED and @atomicLoad(u32, &entry.tag, .acquire) == tag) return entry;
+        idx = (idx + 1) & mask;
+    }
+
+    return null;
+}
+
+fn insertInSegment(seg: *AggSegmentV1, tag: u32) ?*AggEntryV1 {
+    const count: usize = @intCast(seg.entry_count);
+    if (count == 0) return null;
+
+    const mask = count - 1;
+    var idx: usize = hashTag(tag) & mask;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const entry = &segmentEntriesPtr(seg)[idx];
+        const state = @atomicLoad(u32, &entry.reserved0, .acquire);
+        if (state == ENTRY_USED) {
+            if (@atomicLoad(u32, &entry.tag, .acquire) == tag) return entry;
+        } else if (state == ENTRY_EMPTY) {
+            // Publish in two steps so lock-free readers never treat a slot as
+            // empty while the tag field is being written.
+            @atomicStore(u32, &entry.reserved0, ENTRY_WRITING, .release);
+            @atomicStore(u32, &entry.tag, tag, .release);
+            @atomicStore(u32, &entry.reserved0, ENTRY_USED, .release);
+            return entry;
+        }
+        idx = (idx + 1) & mask;
+    }
+
+    return null;
+}
+
+fn createAggSegment(capacity: usize) !*AggSegmentV1 {
+    // capacity must be a power of two for mask-based probing.
+    if (capacity == 0 or !std.math.isPowerOfTwo(capacity)) return error.InvalidSize;
+
+    const entry_size = @sizeOf(AggEntryV1);
+    const header_size = @sizeOf(AggSegmentV1);
+    var bytes_needed = try std.math.mul(usize, capacity, entry_size);
+    bytes_needed = try std.math.add(usize, bytes_needed, header_size);
+
+    const map_len = std.mem.alignForward(usize, bytes_needed, pageSize());
+    if (map_len > std.math.maxInt(u32)) return error.Overflow;
+    if (entry_size > std.math.maxInt(u16)) return error.Overflow;
+    if (capacity > std.math.maxInt(u16)) return error.Overflow;
+
+    const base_ptr = try osMmap(map_len);
+    const seg: *AggSegmentV1 = @ptrCast(@alignCast(base_ptr));
+    seg.* = .{
+        .segment_size = @intCast(map_len),
+        .entry_stride = @intCast(entry_size),
+        .entry_count = @intCast(capacity),
+        .next_segment = 0,
+        .reserved0 = 0,
+    };
+    // Entries are zeroed by mmap.
+    return seg;
+}
+
+fn publishBegin() void {
+    _ = @atomicRmw(u64, &g_tagalloc_registry.publish_seq, .Add, 1, .acq_rel);
+}
+
+fn publishEnd() void {
+    _ = @atomicRmw(u64, &g_tagalloc_registry.publish_seq, .Add, 1, .acq_rel);
+}
+
+fn appendAggSegmentLocked() !*AggSegmentV1 {
+    // Caller must hold g_tag_table_lock.
+    publishBegin();
+    errdefer publishEnd();
+
+    const new_seg = try createAggSegment(SegmentCapacity);
+
+    // Walk to tail and link.
+    var tail: *AggSegmentV1 = &g_base_segment.header;
+    while (true) {
+        const next = @atomicLoad(usize, &tail.next_segment, .acquire);
+        if (next == 0) break;
+        tail = @ptrFromInt(next);
+    }
+
+    @atomicStore(usize, &tail.next_segment, @intFromPtr(new_seg), .release);
+    publishEnd();
+    return new_seg;
+}
+
 fn findOrInsertEntry(tag: u32) *AggEntryV1 {
     // Fast path: probe without lock for existing entry.
     const cap_mask = BaseCapacity - 1;
@@ -171,41 +282,74 @@ fn findOrInsertEntry(tag: u32) *AggEntryV1 {
     var i: usize = 0;
     while (i < BaseCapacity) : (i += 1) {
         const entry = &g_base_segment.entries[idx];
-        const state = @atomicLoad(u32, &entry.reserved0, .monotonic);
-        const cur_tag = @atomicLoad(u32, &entry.tag, .monotonic);
-        if (state == 1 and cur_tag == tag) return entry;
-        if (state == 0) break;
+        const state = @atomicLoad(u32, &entry.reserved0, .acquire);
+        const cur_tag = @atomicLoad(u32, &entry.tag, .acquire);
+        if (state == ENTRY_USED and cur_tag == tag) return entry;
+        if (state == ENTRY_EMPTY) break;
         idx = (idx + 1) & cap_mask;
+    }
+
+    // Missed in base; check appended segments without taking locks.
+    var next_seg = @atomicLoad(usize, &g_base_segment.header.next_segment, .acquire);
+    while (next_seg != 0) {
+        const seg: *AggSegmentV1 = @ptrFromInt(next_seg);
+        if (findInSegment(seg, tag)) |found| return found;
+        next_seg = @atomicLoad(usize, &seg.next_segment, .acquire);
     }
 
     // Insert path.
     g_tag_table_lock.lock();
     defer g_tag_table_lock.unlock();
 
+    // Re-check all segments under lock to avoid duplicates.
+    if (findExistingEntry(tag)) |existing| return existing;
+
     idx = hashTag(tag) & cap_mask;
     i = 0;
     while (i < BaseCapacity) : (i += 1) {
         const entry = &g_base_segment.entries[idx];
-        const state = @atomicLoad(u32, &entry.reserved0, .monotonic);
-        if (state == 1) {
-            if (@atomicLoad(u32, &entry.tag, .monotonic) == tag) return entry;
-        } else {
-            // Claim.
-            @atomicStore(u32, &entry.tag, tag, .monotonic);
-            @atomicStore(u32, &entry.reserved0, 1, .monotonic);
+        const state = @atomicLoad(u32, &entry.reserved0, .acquire);
+        if (state == ENTRY_USED) {
+            if (@atomicLoad(u32, &entry.tag, .acquire) == tag) return entry;
+        } else if (state == ENTRY_EMPTY) {
+            // Claim (two-step publish for lock-free readers).
+            @atomicStore(u32, &entry.reserved0, ENTRY_WRITING, .release);
+            @atomicStore(u32, &entry.tag, tag, .release);
+            @atomicStore(u32, &entry.reserved0, ENTRY_USED, .release);
             return entry;
         }
         idx = (idx + 1) & cap_mask;
     }
 
-    // Degraded: overflow bucket.
+    // Base full: try appended segments.
+    next_seg = @atomicLoad(usize, &g_base_segment.header.next_segment, .acquire);
+    while (next_seg != 0) {
+        const seg: *AggSegmentV1 = @ptrFromInt(next_seg);
+        if (insertInSegment(seg, tag)) |inserted| return inserted;
+        next_seg = @atomicLoad(usize, &seg.next_segment, .acquire);
+    }
+
+    // Need to grow the segment list.
+    const new_seg = appendAggSegmentLocked() catch {
+        // Degraded: overflow bucket.
+        _ = @atomicRmw(u64, &g_tagalloc_registry.flags, .Or, FLAG_DEGRADED, .monotonic);
+        _ = @atomicRmw(u64, &g_tagalloc_registry.dropped_tag_count, .Add, 1, .monotonic);
+
+        // Slot 0 is reserved as overflow bucket.
+        const overflow = &g_base_segment.entries[0];
+        @atomicStore(u32, &overflow.tag, OVERFLOW_TAG, .release);
+        @atomicStore(u32, &overflow.reserved0, ENTRY_USED, .release);
+        return overflow;
+    };
+
+    if (insertInSegment(new_seg, tag)) |inserted| return inserted;
+
+    // Should be impossible: the new segment is empty.
     _ = @atomicRmw(u64, &g_tagalloc_registry.flags, .Or, FLAG_DEGRADED, .monotonic);
     _ = @atomicRmw(u64, &g_tagalloc_registry.dropped_tag_count, .Add, 1, .monotonic);
-
-    // Slot 0 is reserved as overflow bucket.
     const overflow = &g_base_segment.entries[0];
-    @atomicStore(u32, &overflow.tag, OVERFLOW_TAG, .monotonic);
-    @atomicStore(u32, &overflow.reserved0, 1, .monotonic);
+    @atomicStore(u32, &overflow.tag, OVERFLOW_TAG, .release);
+    @atomicStore(u32, &overflow.reserved0, ENTRY_USED, .release);
     return overflow;
 }
 
@@ -215,11 +359,19 @@ fn findExistingEntry(tag: u32) ?*AggEntryV1 {
     var i: usize = 0;
     while (i < BaseCapacity) : (i += 1) {
         const entry = &g_base_segment.entries[idx];
-        const state = @atomicLoad(u32, &entry.reserved0, .monotonic);
-        if (state == 0) return null;
-        if (@atomicLoad(u32, &entry.tag, .monotonic) == tag) return entry;
+        const state = @atomicLoad(u32, &entry.reserved0, .acquire);
+        if (state == ENTRY_EMPTY) break;
+        if (state == ENTRY_USED and @atomicLoad(u32, &entry.tag, .acquire) == tag) return entry;
         idx = (idx + 1) & cap_mask;
     }
+
+    var next_seg = @atomicLoad(usize, &g_base_segment.header.next_segment, .acquire);
+    while (next_seg != 0) {
+        const seg: *AggSegmentV1 = @ptrFromInt(next_seg);
+        if (findInSegment(seg, tag)) |found| return found;
+        next_seg = @atomicLoad(usize, &seg.next_segment, .acquire);
+    }
+
     return null;
 }
 
@@ -377,6 +529,33 @@ test "registry initializes and points at base segment" {
     try std.testing.expectEqual(TAGALLOC_REGISTRY_MAGIC, reg.magic);
     try std.testing.expectEqual(TAGALLOC_ABI_VERSION, reg.abi_version);
     try std.testing.expect(reg.first_segment != 0);
+}
+
+test "segment list walking finds entries in appended segments" {
+    ensureRegistryInit();
+
+    const before_seq = @atomicLoad(u64, &g_tagalloc_registry.publish_seq, .acquire);
+
+    g_tag_table_lock.lock();
+    const seg = appendAggSegmentLocked() catch {
+        g_tag_table_lock.unlock();
+        return error.TestUnexpectedResult;
+    };
+
+    // Insert a tag into the new segment (not into base).
+    const tag: u32 = 0x5A595857; // "WXYZ" in little-endian display order
+    const inserted = insertInSegment(seg, tag) orelse {
+        g_tag_table_lock.unlock();
+        return error.TestUnexpectedResult;
+    };
+    g_tag_table_lock.unlock();
+
+    const after_seq = @atomicLoad(u64, &g_tagalloc_registry.publish_seq, .acquire);
+    try std.testing.expect((after_seq & 1) == 0);
+    try std.testing.expectEqual(before_seq + 2, after_seq);
+
+    const found = findOrInsertEntry(tag);
+    try std.testing.expectEqual(@intFromPtr(inserted), @intFromPtr(found));
 }
 
 test "alloc/free bumps per-tag counters" {
