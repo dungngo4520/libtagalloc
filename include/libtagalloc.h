@@ -64,8 +64,11 @@ typedef struct tagalloc_agg_entry_v1 {
 
 // Public API (ExAllocatePoolWithTag-inspired)
 // size must be > 0.
+// alignment is optional: alignment==0 uses the library default.
+// If provided, alignment must be a power of two.
 
 void *tagalloc_alloc(uint32_t tag, size_t size);
+void *tagalloc_aligned_alloc(uint32_t tag, size_t size, size_t alignment);
 void tagalloc_free(void *ptr);
 void tagalloc_free_with_tag(void *ptr, uint32_t expected_tag);
 

@@ -109,10 +109,12 @@ pub export var g_tagalloc_registry: RegistryV1 = .{
 };
 
 const AllocHeader = extern struct {
+    mapping_base: usize,
     mapping_len: usize,
     user_size: usize,
     tag: u32,
-    reserved0: u32,
+    align_log2: u8,
+    reserved0: [3]u8,
 };
 
 fn isLittleEndian() bool {
@@ -249,30 +251,45 @@ fn osMunmap(ptr: [*]u8, len: usize) void {
     _ = linux.munmap(ptr, len);
 }
 
-fn allocInternal(tag: u32, size: usize) ![*]u8 {
+fn normalizeAlignment(alignment: usize) !usize {
+    const min_align = defaultAlign();
+    if (alignment == 0) return min_align;
+    if (!std.math.isPowerOfTwo(alignment)) return error.InvalidAlignment;
+    if (alignment < min_align) return min_align;
+    return alignment;
+}
+
+fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     if (size == 0) return error.InvalidSize;
 
     ensureRegistryInit();
 
     const hdr_size = @sizeOf(AllocHeader);
     const prefix_size = @sizeOf(usize);
-    const alignment = defaultAlign();
+    const effective_alignment = try normalizeAlignment(alignment);
 
-    const raw_needed = hdr_size + prefix_size + size + alignment;
+    var raw_needed = try std.math.add(usize, hdr_size, prefix_size);
+    raw_needed = try std.math.add(usize, raw_needed, size);
+    raw_needed = try std.math.add(usize, raw_needed, effective_alignment);
     const map_len = std.mem.alignForward(usize, raw_needed, pageSize());
 
     const base_ptr = try osMmap(map_len);
 
-    const hdr: *AllocHeader = @ptrCast(@alignCast(base_ptr));
+    const base_addr = @intFromPtr(base_ptr);
+    const hdr_addr = std.mem.alignForward(usize, base_addr, effective_alignment);
+
+    const hdr: *AllocHeader = @ptrFromInt(hdr_addr);
     hdr.* = .{
+        .mapping_base = base_addr,
         .mapping_len = map_len,
         .user_size = size,
         .tag = tag,
-        .reserved0 = 0,
+        .align_log2 = @intCast(@ctz(effective_alignment)),
+        .reserved0 = .{ 0, 0, 0 },
     };
 
-    const after_hdr = @intFromPtr(base_ptr) + hdr_size;
-    const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, alignment);
+    const after_hdr = hdr_addr + hdr_size;
+    const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
     const prefix_addr = user_addr - prefix_size;
 
     const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
@@ -305,12 +322,17 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
     const entry = findOrInsertEntry(hdr.tag);
     bumpFree(entry, hdr.user_size);
 
-    osMunmap(@ptrCast(hdr), hdr.mapping_len);
+    osMunmap(@ptrFromInt(hdr.mapping_base), hdr.mapping_len);
 }
 
 // C ABI exports
 pub export fn tagalloc_alloc(tag: u32, size: usize) ?*anyopaque {
-    const p = allocInternal(tag, size) catch return null;
+    const p = allocInternal(tag, size, 0) catch return null;
+    return @ptrCast(p);
+}
+
+pub export fn tagalloc_aligned_alloc(tag: u32, size: usize, alignment: usize) ?*anyopaque {
+    const p = allocInternal(tag, size, alignment) catch return null;
     return @ptrCast(p);
 }
 
@@ -331,6 +353,23 @@ pub export fn tagalloc_get_registry() *const RegistryV1 {
 
 test "size==0 returns null via C ABI" {
     try std.testing.expect(tagalloc_alloc(0x41414141, 0) == null);
+}
+
+test "aligned alloc returns properly aligned pointer" {
+    const tag: u32 = 0x44434241; // "ABCD" in little-endian display order
+
+    {
+        const p = tagalloc_aligned_alloc(tag, 1, 64) orelse return error.TestUnexpectedResult;
+        defer tagalloc_free(p);
+        try std.testing.expect((@intFromPtr(p) & 63) == 0);
+    }
+
+    {
+        const p = tagalloc_aligned_alloc(tag, 1, 0) orelse return error.TestUnexpectedResult;
+        defer tagalloc_free(p);
+        const min_align = defaultAlign();
+        try std.testing.expect((@intFromPtr(p) % min_align) == 0);
+    }
 }
 
 test "registry initializes and points at base segment" {
