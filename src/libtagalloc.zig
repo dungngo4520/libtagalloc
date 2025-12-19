@@ -207,6 +207,20 @@ fn findOrInsertEntry(tag: u32) *AggEntryV1 {
     return overflow;
 }
 
+fn findExistingEntry(tag: u32) ?*AggEntryV1 {
+    const cap_mask = BaseCapacity - 1;
+    var idx: usize = hashTag(tag) & cap_mask;
+    var i: usize = 0;
+    while (i < BaseCapacity) : (i += 1) {
+        const entry = &g_base_segment.entries[idx];
+        const state = @atomicLoad(u32, &entry.reserved0, .monotonic);
+        if (state == 0) return null;
+        if (@atomicLoad(u32, &entry.tag, .monotonic) == tag) return entry;
+        idx = (idx + 1) & cap_mask;
+    }
+    return null;
+}
+
 fn pageSize() usize {
     return std.heap.pageSize();
 }
@@ -313,4 +327,38 @@ pub export fn tagalloc_free_with_tag(ptr: ?*anyopaque, expected_tag: u32) void {
 pub export fn tagalloc_get_registry() *const RegistryV1 {
     ensureRegistryInit();
     return &g_tagalloc_registry;
+}
+
+test "size==0 returns null via C ABI" {
+    try std.testing.expect(tagalloc_alloc(0x41414141, 0) == null);
+}
+
+test "registry initializes and points at base segment" {
+    const reg = tagalloc_get_registry();
+    try std.testing.expectEqual(TAGALLOC_REGISTRY_MAGIC, reg.magic);
+    try std.testing.expectEqual(TAGALLOC_ABI_VERSION, reg.abi_version);
+    try std.testing.expect(reg.first_segment != 0);
+}
+
+test "alloc/free bumps per-tag counters" {
+    const tag: u32 = 0x44434241; // "ABCD" in little-endian display order
+
+    const before = findOrInsertEntry(tag);
+    const before_alloc_count = @atomicLoad(u64, &before.alloc_count, .monotonic);
+    const before_alloc_bytes = @atomicLoad(u64, &before.alloc_bytes, .monotonic);
+    const before_free_count = @atomicLoad(u64, &before.free_count, .monotonic);
+    const before_free_bytes = @atomicLoad(u64, &before.free_bytes, .monotonic);
+
+    {
+        const p = tagalloc_alloc(tag, 64) orelse return error.TestUnexpectedResult;
+        defer tagalloc_free(p);
+
+        const entry = findExistingEntry(tag) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(before_alloc_count + 1, @atomicLoad(u64, &entry.alloc_count, .monotonic));
+        try std.testing.expectEqual(before_alloc_bytes + 64, @atomicLoad(u64, &entry.alloc_bytes, .monotonic));
+    }
+
+    const entry_after = findExistingEntry(tag) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(before_free_count + 1, @atomicLoad(u64, &entry_after.free_count, .monotonic));
+    try std.testing.expectEqual(before_free_bytes + 64, @atomicLoad(u64, &entry_after.free_bytes, .monotonic));
 }
