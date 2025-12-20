@@ -204,6 +204,31 @@ pub fn freeWithExpectedTag(ptr: [*]u8, expected_tag: u32) void {
     freeInternal(ptr, expected_tag);
 }
 
+pub fn realloc(tag: u32, ptr: ?[*]u8, new_size: usize) ![*]u8 {
+    if (new_size == 0) return error.InvalidSize;
+
+    if (ptr == null) {
+        return alloc(tag, new_size);
+    }
+
+    const old_ptr = ptr.?;
+
+    const prefix_size = @sizeOf(usize);
+    const prefix_addr = @intFromPtr(old_ptr) - prefix_size;
+    const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
+    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+
+    const old_size = hdr.user_size;
+    const alignment: usize = @as(usize, 1) << @as(u6, @intCast(hdr.align_log2));
+
+    // Allocate first; on failure, the old allocation stays valid.
+    const new_ptr = try alignedAlloc(tag, new_size, alignment);
+    const to_copy = @min(old_size, new_size);
+    @memcpy(new_ptr[0..to_copy], old_ptr[0..to_copy]);
+    free(old_ptr);
+    return new_ptr;
+}
+
 test "aligned alloc returns properly aligned pointer" {
     const tag: u32 = 0x44434241; // "ABCD" in little-endian display order
 

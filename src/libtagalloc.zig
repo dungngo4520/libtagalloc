@@ -39,6 +39,15 @@ pub export fn tagalloc_free_with_tag(ptr: ?*anyopaque, expected_tag: u32) void {
     allocator.freeWithExpectedTag(@ptrCast(ptr.?), expected_tag);
 }
 
+pub export fn tagalloc_realloc(tag: u32, ptr: ?*anyopaque, new_size: usize) ?*anyopaque {
+    const p = allocator.realloc(
+        tag,
+        if (ptr) |p0| @as([*]u8, @ptrCast(p0)) else null,
+        new_size,
+    ) catch return null;
+    return @ptrCast(p);
+}
+
 pub export fn tagalloc_get_registry() *const RegistryV1 {
     return registry.getRegistry();
 }
