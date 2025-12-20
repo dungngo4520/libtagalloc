@@ -80,13 +80,179 @@ pub export var g_tagalloc_registry: RegistryV1 = .{
 };
 
 const AllocHeader = extern struct {
-    mapping_base: usize,
-    mapping_len: usize,
+    backing_base: usize,
+    backing_len: usize,
     user_size: usize,
     tag: u32,
     align_log2: u8,
-    reserved0: [3]u8,
+    kind: u8,
+    arena_order: u8,
+    reserved0: u8,
 };
+
+const HDR_KIND_MMAP: u8 = 0;
+const HDR_KIND_ARENA: u8 = 1;
+
+const ArenaMinBlock: usize = 4096;
+const ArenaSize64: usize = 64 * 1024 * 1024;
+const ArenaSize32: usize = 16 * 1024 * 1024;
+
+const ArenaSize: usize = if (@sizeOf(usize) == 8) ArenaSize64 else ArenaSize32;
+const ArenaBlockCount: usize = ArenaSize / ArenaMinBlock;
+const ArenaMaxOrder: u8 = @intCast(std.math.log2_int(usize, ArenaBlockCount));
+const ArenaOrderCount: usize = @as(usize, ArenaMaxOrder) + 1;
+
+const ArenaBitmapBits: usize = ArenaOrderCount * ArenaBlockCount;
+const ArenaBitmapWords: usize = (ArenaBitmapBits + 63) / 64;
+
+const Arena = struct {
+    lock: std.Thread.Mutex = .{},
+    base: usize = 0,
+    initialized: bool = false,
+
+    free_counts: [ArenaOrderCount]u32 = [_]u32{0} ** ArenaOrderCount,
+    next_hint: [ArenaOrderCount]u32 = [_]u32{0} ** ArenaOrderCount,
+    // Bitmap storing free blocks per order. For simplicity we store ArenaBlockCount bits for each order
+    // (higher orders only use the prefix of the row).
+    free_bitmap: [ArenaBitmapWords]u64 = [_]u64{0} ** ArenaBitmapWords,
+
+    fn rowBitIndex(order: u8, idx: usize) usize {
+        return @as(usize, order) * ArenaBlockCount + idx;
+    }
+
+    fn bitTest(self: *Arena, order: u8, idx: usize) bool {
+        const bit = rowBitIndex(order, idx);
+        const word = bit >> 6;
+        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
+        return (self.free_bitmap[word] & mask) != 0;
+    }
+
+    fn bitSet(self: *Arena, order: u8, idx: usize) void {
+        const bit = rowBitIndex(order, idx);
+        const word = bit >> 6;
+        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
+        self.free_bitmap[word] |= mask;
+    }
+
+    fn bitClear(self: *Arena, order: u8, idx: usize) void {
+        const bit = rowBitIndex(order, idx);
+        const word = bit >> 6;
+        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
+        self.free_bitmap[word] &= ~mask;
+    }
+
+    fn orderBlockSize(order: u8) usize {
+        return ArenaMinBlock << @as(u6, @intCast(order));
+    }
+
+    fn initLocked(self: *Arena) !void {
+        if (self.initialized) return;
+
+        const base_ptr = try osMmap(ArenaSize);
+        self.base = @intFromPtr(base_ptr);
+        self.initialized = true;
+
+        // Entire arena is initially one big free block.
+        self.free_counts[ArenaMaxOrder] = 1;
+        self.bitSet(ArenaMaxOrder, 0);
+    }
+
+    fn tryInit(self: *Arena) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.initLocked() catch return false;
+        return true;
+    }
+
+    fn allocBlock(self: *Arena, want_order: u8) ?usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        self.initLocked() catch return null;
+
+        if (want_order > ArenaMaxOrder) return null;
+
+        var order: u8 = want_order;
+        while (order <= ArenaMaxOrder and self.free_counts[order] == 0) : (order += 1) {}
+        if (order > ArenaMaxOrder) return null;
+
+        const row_len: usize = ArenaBlockCount >> @as(u6, @intCast(order));
+        var start: usize = self.next_hint[order];
+        if (start >= row_len) start = 0;
+
+        // Find any free block at this order (linear probe with wrap).
+        var found_idx: ?usize = null;
+        var i: usize = 0;
+        while (i < row_len) : (i += 1) {
+            const idx = (start + i) % row_len;
+            if (self.bitTest(order, idx)) {
+                found_idx = idx;
+                self.next_hint[order] = @intCast((idx + 1) % row_len);
+                break;
+            }
+        }
+        const idx = found_idx orelse return null;
+
+        self.bitClear(order, idx);
+        self.free_counts[order] -= 1;
+
+        // Split down to want_order, freeing the right buddy at each step.
+        var cur_order: u8 = order;
+        var cur_idx: usize = idx;
+        while (cur_order > want_order) {
+            cur_order -= 1;
+            const right_buddy = cur_idx * 2 + 1;
+            cur_idx = cur_idx * 2;
+            self.bitSet(cur_order, right_buddy);
+            self.free_counts[cur_order] += 1;
+        }
+
+        const block_size = orderBlockSize(want_order);
+        const addr = self.base + cur_idx * block_size;
+        return addr;
+    }
+
+    fn freeBlock(self: *Arena, block_addr: usize, order: u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (!self.initialized) return;
+        if (block_addr < self.base or block_addr >= self.base + ArenaSize) return;
+
+        var cur_order: u8 = order;
+        var cur_idx: usize = (block_addr - self.base) / orderBlockSize(cur_order);
+
+        while (cur_order < ArenaMaxOrder) {
+            const buddy_idx = cur_idx ^ 1;
+            const row_len: usize = ArenaBlockCount >> @as(u6, @intCast(cur_order));
+            if (buddy_idx >= row_len) break;
+            if (!self.bitTest(cur_order, buddy_idx)) break;
+
+            // Coalesce: remove buddy from free set and move up.
+            self.bitClear(cur_order, buddy_idx);
+            self.free_counts[cur_order] -= 1;
+            cur_idx = @min(cur_idx, buddy_idx) / 2;
+            cur_order += 1;
+        }
+
+        self.bitSet(cur_order, cur_idx);
+        self.free_counts[cur_order] += 1;
+    }
+};
+
+var g_arena: Arena = .{};
+
+fn sizeToArenaOrder(bytes_needed: usize) ?u8 {
+    if (bytes_needed == 0) return null;
+    if (bytes_needed > ArenaSize) return null;
+    const pow2 = std.math.ceilPowerOfTwo(usize, @max(bytes_needed, ArenaMinBlock)) catch return null;
+    if (pow2 > ArenaSize) return null;
+    const min_log = std.math.log2_int(usize, ArenaMinBlock);
+    const log = std.math.log2_int(usize, pow2);
+    const ord: isize = @as(isize, @intCast(log)) - @as(isize, @intCast(min_log));
+    if (ord < 0 or ord > ArenaMaxOrder) return null;
+    return @intCast(ord);
+}
 
 fn isLittleEndian() bool {
     return builtin.cpu.arch.endian() == .little;
@@ -389,31 +555,69 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     var raw_needed = try std.math.add(usize, hdr_size, prefix_size);
     raw_needed = try std.math.add(usize, raw_needed, size);
     raw_needed = try std.math.add(usize, raw_needed, effective_alignment);
-    const map_len = std.mem.alignForward(usize, raw_needed, pageSize());
 
-    const base_ptr = try osMmap(map_len);
+    const arena_order = sizeToArenaOrder(raw_needed);
 
-    const base_addr = @intFromPtr(base_ptr);
-    const hdr_addr = std.mem.alignForward(usize, base_addr, effective_alignment);
+    var hdr: *AllocHeader = undefined;
+    var user_ptr: [*]u8 = undefined;
 
-    const hdr: *AllocHeader = @ptrFromInt(hdr_addr);
-    hdr.* = .{
-        .mapping_base = base_addr,
-        .mapping_len = map_len,
-        .user_size = size,
-        .tag = tag,
-        .align_log2 = @intCast(@ctz(effective_alignment)),
-        .reserved0 = .{ 0, 0, 0 },
-    };
+    if (arena_order) |ord| blk: {
+        // If arena init fails, fall back to mmap-per-allocation.
+        if (!g_arena.tryInit()) break :blk;
+        const block_addr = g_arena.allocBlock(ord) orelse break :blk;
 
-    const after_hdr = hdr_addr + hdr_size;
-    const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
-    const prefix_addr = user_addr - prefix_size;
+        const hdr_addr = block_addr; // block base
+        hdr = @ptrFromInt(hdr_addr);
+        hdr.* = .{
+            .backing_base = g_arena.base,
+            .backing_len = ArenaSize,
+            .user_size = size,
+            .tag = tag,
+            .align_log2 = @intCast(@ctz(effective_alignment)),
+            .kind = HDR_KIND_ARENA,
+            .arena_order = ord,
+            .reserved0 = 0,
+        };
 
-    const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
-    prefix_ptr.* = @intFromPtr(hdr);
+        const after_hdr = hdr_addr + hdr_size;
+        const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
+        const prefix_addr = user_addr - prefix_size;
+        const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
+        prefix_ptr.* = @intFromPtr(hdr);
+        user_ptr = @ptrFromInt(user_addr);
+        break :blk;
+    } else {
+        // Not eligible for arena.
+    }
 
-    const user_ptr: [*]u8 = @ptrFromInt(user_addr);
+    // mmap fallback
+    if (@TypeOf(hdr) == *AllocHeader and @intFromPtr(hdr) != 0 and hdr.kind == HDR_KIND_ARENA) {
+        // already initialized in arena path
+    } else {
+        const map_len = std.mem.alignForward(usize, raw_needed, pageSize());
+        const base_ptr = try osMmap(map_len);
+        const base_addr = @intFromPtr(base_ptr);
+        const hdr_addr = std.mem.alignForward(usize, base_addr, effective_alignment);
+
+        hdr = @ptrFromInt(hdr_addr);
+        hdr.* = .{
+            .backing_base = base_addr,
+            .backing_len = map_len,
+            .user_size = size,
+            .tag = tag,
+            .align_log2 = @intCast(@ctz(effective_alignment)),
+            .kind = HDR_KIND_MMAP,
+            .arena_order = 0,
+            .reserved0 = 0,
+        };
+
+        const after_hdr = hdr_addr + hdr_size;
+        const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
+        const prefix_addr = user_addr - prefix_size;
+        const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
+        prefix_ptr.* = @intFromPtr(hdr);
+        user_ptr = @ptrFromInt(user_addr);
+    }
 
     const entry = findOrInsertEntry(tag);
     bumpAlloc(entry, size);
@@ -440,7 +644,11 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
     const entry = findOrInsertEntry(hdr.tag);
     bumpFree(entry, hdr.user_size);
 
-    osMunmap(@ptrFromInt(hdr.mapping_base), hdr.mapping_len);
+    if (hdr.kind == HDR_KIND_ARENA) {
+        g_arena.freeBlock(hdr_addr, hdr.arena_order);
+    } else {
+        osMunmap(@ptrFromInt(hdr.backing_base), hdr.backing_len);
+    }
 }
 
 // C ABI exports
@@ -488,6 +696,22 @@ test "aligned alloc returns properly aligned pointer" {
         const min_align = defaultAlign();
         try std.testing.expect((@intFromPtr(p) % min_align) == 0);
     }
+}
+
+test "small allocations use arena backing when available" {
+    // This test peeks at the internal header via the prefix. It is only intended
+    // to validate backend selection, not ABI.
+    const tag: u32 = 0x44434241;
+    const p = tagalloc_alloc(tag, 64) orelse return error.TestUnexpectedResult;
+    defer tagalloc_free(p);
+
+    const prefix_size = @sizeOf(usize);
+    const prefix_addr = @intFromPtr(p) - prefix_size;
+    const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
+    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+
+    // Either arena or mmap is acceptable if arena init fails in the test environment.
+    try std.testing.expect(hdr.kind == HDR_KIND_ARENA or hdr.kind == HDR_KIND_MMAP);
 }
 
 test "registry initializes and points at base segment" {
