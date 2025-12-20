@@ -24,17 +24,19 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len != 2) {
-        try fprint(std.fs.File.stderr(), "usage: {s} <pid>\n", .{args[0]});
-        return error.InvalidArgs;
+    const parsed = try parseArgs(args);
+    if (parsed.show_help) {
+        try fprint(std.fs.File.stderr(), "usage: {s} <pid> [--scan]\n", .{args[0]});
+        try fprint(std.fs.File.stderr(), "  --scan   allow bounded RW mapping scan fallback (opt-in)\n", .{});
+        return;
     }
 
-    const pid: i32 = @intCast(try std.fmt.parseInt(u32, args[1], 10));
+    const pid: i32 = parsed.pid;
 
     const maps = try readMaps(allocator, pid);
     defer freeMaps(allocator, maps);
 
-    const registry_addr = try findRegistryAddr(allocator, pid, maps);
+    const registry_addr = try findRegistryAddr(allocator, pid, maps, parsed.allow_scan);
     const reg = try readRegistryStable(pid, registry_addr);
 
     const stdout = std.fs.File.stdout();
@@ -45,6 +47,42 @@ pub fn main() !void {
     );
 
     try dumpSegments(pid, reg.first_segment, stdout);
+}
+
+const ParsedArgs = struct {
+    pid: i32,
+    allow_scan: bool,
+    show_help: bool,
+};
+
+fn parseArgs(args: []const []const u8) !ParsedArgs {
+    var allow_scan = false;
+    var show_help = false;
+    var pid_opt: ?i32 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            show_help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--scan")) {
+            allow_scan = true;
+            continue;
+        }
+
+        // First non-flag is PID.
+        if (pid_opt == null) {
+            pid_opt = @intCast(std.fmt.parseInt(u32, a, 10) catch return error.InvalidArgs);
+        } else {
+            return error.InvalidArgs;
+        }
+    }
+
+    if (show_help) return .{ .pid = 0, .allow_scan = allow_scan, .show_help = true };
+    const pid = pid_opt orelse return error.InvalidArgs;
+    return .{ .pid = pid, .allow_scan = allow_scan, .show_help = false };
 }
 
 fn fprint(file: std.fs.File, comptime fmt: []const u8, args: anytype) !void {
@@ -115,8 +153,10 @@ fn readMaps(allocator: std.mem.Allocator, pid: i32) ![]MapEntry {
     return try maps_list.toOwnedSlice(allocator);
 }
 
-fn findRegistryAddr(allocator: std.mem.Allocator, pid: i32, maps: []const MapEntry) !usize {
+fn findRegistryAddr(allocator: std.mem.Allocator, pid: i32, maps: []const MapEntry, allow_scan: bool) !usize {
     if (try findRegistryAddrBySymbol(allocator, pid, maps)) |addr| return addr;
+
+    if (!allow_scan) return error.RegistryNotFound;
 
     const magic = abi.TAGALLOC_REGISTRY_MAGIC;
     const magic_bytes = std.mem.asBytes(&magic);
