@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const os = @import("os.zig");
+const os = @import("../platform/os.zig");
 
 pub const ArenaMinBlock: usize = 4096;
 pub const ArenaSize64: usize = 64 * 1024 * 1024;
