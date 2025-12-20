@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const TAGALLOC_VERSION = "0.1.0";
+pub const TAGALLOC_VERSION = "0.2.0";
 pub const TAGALLOC_ABI_VERSION: u32 = 1;
 pub const TAGALLOC_REGISTRY_MAGIC: u64 = 0x5441_4741_4C4C_4F43; // "TAGALLOC"
 
