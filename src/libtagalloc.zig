@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const abi = @import("abi");
+const os = @import("os.zig");
+const arena = @import("arena.zig");
 
 pub const TAGALLOC_ABI_VERSION = abi.TAGALLOC_ABI_VERSION;
 pub const TAGALLOC_REGISTRY_MAGIC = abi.TAGALLOC_REGISTRY_MAGIC;
@@ -93,166 +95,7 @@ const AllocHeader = extern struct {
 const HDR_KIND_MMAP: u8 = 0;
 const HDR_KIND_ARENA: u8 = 1;
 
-const ArenaMinBlock: usize = 4096;
-const ArenaSize64: usize = 64 * 1024 * 1024;
-const ArenaSize32: usize = 16 * 1024 * 1024;
-
-const ArenaSize: usize = if (@sizeOf(usize) == 8) ArenaSize64 else ArenaSize32;
-const ArenaBlockCount: usize = ArenaSize / ArenaMinBlock;
-const ArenaMaxOrder: u8 = @intCast(std.math.log2_int(usize, ArenaBlockCount));
-const ArenaOrderCount: usize = @as(usize, ArenaMaxOrder) + 1;
-
-const ArenaBitmapBits: usize = ArenaOrderCount * ArenaBlockCount;
-const ArenaBitmapWords: usize = (ArenaBitmapBits + 63) / 64;
-
-const Arena = struct {
-    lock: std.Thread.Mutex = .{},
-    base: usize = 0,
-    initialized: bool = false,
-
-    free_counts: [ArenaOrderCount]u32 = [_]u32{0} ** ArenaOrderCount,
-    next_hint: [ArenaOrderCount]u32 = [_]u32{0} ** ArenaOrderCount,
-    // Bitmap storing free blocks per order. For simplicity we store ArenaBlockCount bits for each order
-    // (higher orders only use the prefix of the row).
-    free_bitmap: [ArenaBitmapWords]u64 = [_]u64{0} ** ArenaBitmapWords,
-
-    fn rowBitIndex(order: u8, idx: usize) usize {
-        return @as(usize, order) * ArenaBlockCount + idx;
-    }
-
-    fn bitTest(self: *Arena, order: u8, idx: usize) bool {
-        const bit = rowBitIndex(order, idx);
-        const word = bit >> 6;
-        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
-        return (self.free_bitmap[word] & mask) != 0;
-    }
-
-    fn bitSet(self: *Arena, order: u8, idx: usize) void {
-        const bit = rowBitIndex(order, idx);
-        const word = bit >> 6;
-        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
-        self.free_bitmap[word] |= mask;
-    }
-
-    fn bitClear(self: *Arena, order: u8, idx: usize) void {
-        const bit = rowBitIndex(order, idx);
-        const word = bit >> 6;
-        const mask: u64 = @as(u64, 1) << @as(u6, @intCast(bit & 63));
-        self.free_bitmap[word] &= ~mask;
-    }
-
-    fn orderBlockSize(order: u8) usize {
-        return ArenaMinBlock << @as(u6, @intCast(order));
-    }
-
-    fn initLocked(self: *Arena) !void {
-        if (self.initialized) return;
-
-        const base_ptr = try osMmap(ArenaSize);
-        self.base = @intFromPtr(base_ptr);
-        self.initialized = true;
-
-        // Entire arena is initially one big free block.
-        self.free_counts[ArenaMaxOrder] = 1;
-        self.bitSet(ArenaMaxOrder, 0);
-    }
-
-    fn tryInit(self: *Arena) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
-        self.initLocked() catch return false;
-        return true;
-    }
-
-    fn allocBlock(self: *Arena, want_order: u8) ?usize {
-        self.lock.lock();
-        defer self.lock.unlock();
-
-        self.initLocked() catch return null;
-
-        if (want_order > ArenaMaxOrder) return null;
-
-        var order: u8 = want_order;
-        while (order <= ArenaMaxOrder and self.free_counts[order] == 0) : (order += 1) {}
-        if (order > ArenaMaxOrder) return null;
-
-        const row_len: usize = ArenaBlockCount >> @as(u6, @intCast(order));
-        var start: usize = self.next_hint[order];
-        if (start >= row_len) start = 0;
-
-        // Find any free block at this order (linear probe with wrap).
-        var found_idx: ?usize = null;
-        var i: usize = 0;
-        while (i < row_len) : (i += 1) {
-            const idx = (start + i) % row_len;
-            if (self.bitTest(order, idx)) {
-                found_idx = idx;
-                self.next_hint[order] = @intCast((idx + 1) % row_len);
-                break;
-            }
-        }
-        const idx = found_idx orelse return null;
-
-        self.bitClear(order, idx);
-        self.free_counts[order] -= 1;
-
-        // Split down to want_order, freeing the right buddy at each step.
-        var cur_order: u8 = order;
-        var cur_idx: usize = idx;
-        while (cur_order > want_order) {
-            cur_order -= 1;
-            const right_buddy = cur_idx * 2 + 1;
-            cur_idx = cur_idx * 2;
-            self.bitSet(cur_order, right_buddy);
-            self.free_counts[cur_order] += 1;
-        }
-
-        const block_size = orderBlockSize(want_order);
-        const addr = self.base + cur_idx * block_size;
-        return addr;
-    }
-
-    fn freeBlock(self: *Arena, block_addr: usize, order: u8) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-
-        if (!self.initialized) return;
-        if (block_addr < self.base or block_addr >= self.base + ArenaSize) return;
-
-        var cur_order: u8 = order;
-        var cur_idx: usize = (block_addr - self.base) / orderBlockSize(cur_order);
-
-        while (cur_order < ArenaMaxOrder) {
-            const buddy_idx = cur_idx ^ 1;
-            const row_len: usize = ArenaBlockCount >> @as(u6, @intCast(cur_order));
-            if (buddy_idx >= row_len) break;
-            if (!self.bitTest(cur_order, buddy_idx)) break;
-
-            // Coalesce: remove buddy from free set and move up.
-            self.bitClear(cur_order, buddy_idx);
-            self.free_counts[cur_order] -= 1;
-            cur_idx = @min(cur_idx, buddy_idx) / 2;
-            cur_order += 1;
-        }
-
-        self.bitSet(cur_order, cur_idx);
-        self.free_counts[cur_order] += 1;
-    }
-};
-
-var g_arena: Arena = .{};
-
-fn sizeToArenaOrder(bytes_needed: usize) ?u8 {
-    if (bytes_needed == 0) return null;
-    if (bytes_needed > ArenaSize) return null;
-    const pow2 = std.math.ceilPowerOfTwo(usize, @max(bytes_needed, ArenaMinBlock)) catch return null;
-    if (pow2 > ArenaSize) return null;
-    const min_log = std.math.log2_int(usize, ArenaMinBlock);
-    const log = std.math.log2_int(usize, pow2);
-    const ord: isize = @as(isize, @intCast(log)) - @as(isize, @intCast(min_log));
-    if (ord < 0 or ord > ArenaMaxOrder) return null;
-    return @intCast(ord);
-}
+var g_arena: arena.Arena = .{};
 
 fn isLittleEndian() bool {
     return builtin.cpu.arch.endian() == .little;
@@ -360,12 +203,12 @@ fn createAggSegment(capacity: usize) !*AggSegmentV1 {
     var bytes_needed = try std.math.mul(usize, capacity, entry_size);
     bytes_needed = try std.math.add(usize, bytes_needed, header_size);
 
-    const map_len = std.mem.alignForward(usize, bytes_needed, pageSize());
+    const map_len = std.mem.alignForward(usize, bytes_needed, os.pageSize());
     if (map_len > std.math.maxInt(u32)) return error.Overflow;
     if (entry_size > std.math.maxInt(u16)) return error.Overflow;
     if (capacity > std.math.maxInt(u16)) return error.Overflow;
 
-    const base_ptr = try osMmap(map_len);
+    const base_ptr = try os.osMmap(map_len);
     const seg: *AggSegmentV1 = @ptrCast(@alignCast(base_ptr));
     seg.* = .{
         .segment_size = @intCast(map_len),
@@ -507,34 +350,6 @@ fn findExistingEntry(tag: u32) ?*AggEntryV1 {
     return null;
 }
 
-fn pageSize() usize {
-    return std.heap.pageSize();
-}
-
-fn osMmap(len: usize) ![*]u8 {
-    if (builtin.os.tag != .linux) return error.Unsupported;
-
-    const linux = std.os.linux;
-    const prot: usize = linux.PROT.READ | linux.PROT.WRITE;
-    const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
-
-    const addr = linux.mmap(null, len, prot, flags, -1, 0);
-    const err = linux.E.init(addr);
-    if (err != .SUCCESS) return switch (err) {
-        .NOMEM => error.OutOfMemory,
-        else => error.OutOfMemory,
-    };
-
-    return @as([*]u8, @ptrFromInt(addr));
-}
-
-fn osMunmap(ptr: [*]u8, len: usize) void {
-    if (builtin.os.tag != .linux) return;
-
-    const linux = std.os.linux;
-    _ = linux.munmap(ptr, len);
-}
-
 fn normalizeAlignment(alignment: usize) !usize {
     const min_align = defaultAlign();
     if (alignment == 0) return min_align;
@@ -556,10 +371,11 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     raw_needed = try std.math.add(usize, raw_needed, size);
     raw_needed = try std.math.add(usize, raw_needed, effective_alignment);
 
-    const arena_order = sizeToArenaOrder(raw_needed);
+    const arena_order = arena.sizeToArenaOrder(raw_needed);
 
     var hdr: *AllocHeader = undefined;
     var user_ptr: [*]u8 = undefined;
+    var used_arena = false;
 
     if (arena_order) |ord| blk: {
         // If arena init fails, fall back to mmap-per-allocation.
@@ -570,7 +386,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
         hdr = @ptrFromInt(hdr_addr);
         hdr.* = .{
             .backing_base = g_arena.base,
-            .backing_len = ArenaSize,
+            .backing_len = arena.ArenaSize,
             .user_size = size,
             .tag = tag,
             .align_log2 = @intCast(@ctz(effective_alignment)),
@@ -585,17 +401,16 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
         const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
         prefix_ptr.* = @intFromPtr(hdr);
         user_ptr = @ptrFromInt(user_addr);
+        used_arena = true;
         break :blk;
     } else {
         // Not eligible for arena.
     }
 
     // mmap fallback
-    if (@TypeOf(hdr) == *AllocHeader and @intFromPtr(hdr) != 0 and hdr.kind == HDR_KIND_ARENA) {
-        // already initialized in arena path
-    } else {
-        const map_len = std.mem.alignForward(usize, raw_needed, pageSize());
-        const base_ptr = try osMmap(map_len);
+    if (!used_arena) {
+        const map_len = std.mem.alignForward(usize, raw_needed, os.pageSize());
+        const base_ptr = try os.osMmap(map_len);
         const base_addr = @intFromPtr(base_ptr);
         const hdr_addr = std.mem.alignForward(usize, base_addr, effective_alignment);
 
@@ -647,7 +462,7 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
     if (hdr.kind == HDR_KIND_ARENA) {
         g_arena.freeBlock(hdr_addr, hdr.arena_order);
     } else {
-        osMunmap(@ptrFromInt(hdr.backing_base), hdr.backing_len);
+        os.osMunmap(@ptrFromInt(hdr.backing_base), hdr.backing_len);
     }
 }
 
@@ -771,74 +586,6 @@ test "alloc/free bumps per-tag counters" {
     try std.testing.expectEqual(before_free_bytes + 64, @atomicLoad(u64, &entry_after.free_bytes, .monotonic));
 }
 
-test "stress: multithread alloc/free/tag churn" {
-    if (builtin.os.tag != .linux) return error.Unsupported;
-
-    const ThreadCount: usize = 4;
-    const Iterations: usize = 20_000;
-
-    const sizes = [_]usize{ 8, 16, 32, 64, 128, 256, 1024, 4096, 8192 };
-    const aligns = [_]usize{ 0, 0, 0, 16, 32, 64 };
-
-    const WorkerCtx = struct {
-        id: u32,
-    };
-
-    const worker = struct {
-        fn run(ctx: *const WorkerCtx) void {
-            var x: u64 = (@as(u64, ctx.id) + 1) *% 0x9E3779B97F4A7C15;
-
-            var i: usize = 0;
-            while (i < Iterations) : (i += 1) {
-                // xorshift64*
-                x ^= x >> 12;
-                x ^= x << 25;
-                x ^= x >> 27;
-                const rnd = x *% 2685821657736338717;
-
-                const size = sizes[@as(usize, @intCast(rnd % sizes.len))];
-
-                // Generate a printable-ish 4CC tag, unique-ish per thread.
-                const a: u32 = @as(u32, @intCast('A' + (ctx.id % 26)));
-                const b: u32 = @as(u32, @intCast('a' + @as(u32, @intCast((rnd >> 8) % 26))));
-                const c: u32 = @as(u32, @intCast('0' + @as(u32, @intCast((rnd >> 16) % 10))));
-                const d: u32 = @as(u32, @intCast('0' + @as(u32, @intCast((rnd >> 24) % 10))));
-                const tag: u32 = (a) | (b << 8) | (c << 16) | (d << 24);
-
-                const use_aligned = (rnd & 1) == 1;
-                const alignment = aligns[@as(usize, @intCast((rnd >> 32) % aligns.len))];
-
-                const p = if (use_aligned)
-                    tagalloc_aligned_alloc(tag, size, alignment)
-                else
-                    tagalloc_alloc(tag, size);
-
-                if (p == null) {
-                    // OOM is acceptable in stress environments; just stop this worker.
-                    return;
-                }
-
-                // Touch a few bytes to exercise mapping/arena memory.
-                const fill: u8 = @truncate(rnd);
-                @memset(@as([*]u8, @ptrCast(p.?))[0..@min(size, 32)], fill);
-
-                if ((rnd & 0xF) == 0) {
-                    tagalloc_free_with_tag(p.?, tag);
-                } else {
-                    tagalloc_free(p.?);
-                }
-            }
-        }
-    };
-
-    var threads: [ThreadCount]std.Thread = undefined;
-    var ctxs: [ThreadCount]WorkerCtx = undefined;
-
-    var t: usize = 0;
-    while (t < ThreadCount) : (t += 1) {
-        ctxs[t] = .{ .id = @intCast(t) };
-        threads[t] = std.Thread.spawn(.{}, worker.run, .{&ctxs[t]}) catch return error.TestUnexpectedResult;
-    }
-
-    for (threads) |th| th.join();
+test "stress: multithread alloc/free/tag churn (opt-in)" {
+    try @import("stress_test.zig").runStress();
 }

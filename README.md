@@ -18,6 +18,20 @@ Outputs:
 
 - Current backend is Linux-only and uses `mmap/munmap` (no libc heap dependency).
 
+## Tests
+
+Default unit tests:
+
+```bash
+zig build test --summary all
+```
+
+The multithread stress test is **opt-in**:
+
+```bash
+TAGALLOC_STRESS=1 zig build test --summary all
+```
+
 ## Demo + poolreader
 
 Build Zig demo:
