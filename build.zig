@@ -78,7 +78,7 @@ fn addUnitTests(
     const test_step = b.step("test", "Run library tests");
 
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/libtagalloc.zig"),
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
     });

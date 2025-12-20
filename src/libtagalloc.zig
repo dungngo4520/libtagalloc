@@ -42,7 +42,3 @@ pub export fn tagalloc_free_with_tag(ptr: ?*anyopaque, expected_tag: u32) void {
 pub export fn tagalloc_get_registry() *const RegistryV1 {
     return registry.getRegistry();
 }
-
-test "size==0 returns null via C ABI" {
-    try std.testing.expect(tagalloc_alloc(0x41414141, 0) == null);
-}
