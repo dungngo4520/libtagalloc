@@ -1,17 +1,17 @@
 const std = @import("std");
 
-const tagalloc = @import("libtagalloc.zig");
+const tagalloc = @import("tagalloc");
 
 pub fn main() !void {
     // Simple self-demo: allocate/free a few tagged blocks in a loop.
     // Use tagalloc-poolreader against this PID.
 
-    var stdout_buf: [4096]u8 = undefined;
     const stdout = std.fs.File.stdout();
 
     {
+        var buf: [128]u8 = undefined;
         const pid = std.os.linux.getpid();
-        const msg = try std.fmt.bufPrint(&stdout_buf, "tagalloc-demo pid={d}\n", .{pid});
+        const msg = try std.fmt.bufPrint(&buf, "tagalloc-demo pid={d}\n", .{pid});
         try stdout.writeAll(msg);
     }
 
@@ -31,13 +31,11 @@ pub fn main() !void {
             const size = sizes[i % sizes.len];
 
             const p = tagalloc.tagalloc_alloc(tag, size) orelse return error.OutOfMemory;
-            // Touch the memory so the compiler can’t trivially optimize away.
             const fill: u8 = @truncate(iter);
             @memset(@as([*]u8, @ptrCast(p))[0..@min(size, 32)], fill);
             tagalloc.tagalloc_free(p);
         }
 
-        // 100ms.
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }

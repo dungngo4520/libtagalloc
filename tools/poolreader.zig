@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const abi = @import("abi.zig");
+const abi = @import("abi");
 
 const ENTRY_USED: u32 = 1;
 
@@ -34,7 +34,6 @@ pub fn main() !void {
     defer freeMaps(allocator, maps);
 
     const registry_addr = try findRegistryAddr(pid, maps);
-
     const reg = try readRegistryStable(pid, registry_addr);
 
     const stdout = std.fs.File.stdout();
