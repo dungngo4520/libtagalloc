@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
     demo_step.dependOn(demo_zig_step);
     demo_step.dependOn(demo_cpp_step);
 
-    _ = addInstalledExe(
+    const stress_step = addInstalledExe(
         b,
         "tagalloc-stress",
         "examples/stress.zig",
@@ -162,6 +162,23 @@ pub fn build(b: *std.Build) void {
         "stress",
         "Build tagalloc-stress",
     );
+
+    const fixture_step = addInstalledExe(
+        b,
+        "tagalloc-fixture",
+        "examples/fixture.zig",
+        target,
+        optimize,
+        .{ .name = "tagalloc", .module = root_mod },
+        "fixture",
+        "Build tagalloc-fixture",
+    );
+
+    const examples_step = b.step("examples", "Build all examples");
+    examples_step.dependOn(demo_zig_step);
+    examples_step.dependOn(demo_cpp_step);
+    examples_step.dependOn(stress_step);
+    examples_step.dependOn(fixture_step);
 
     addUnitTests(b, target, optimize, abi_mod);
 }
