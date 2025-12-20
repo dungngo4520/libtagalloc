@@ -10,4 +10,5 @@ test {
     // Pull in module-local tests.
     _ = @import("core/allocator.zig");
     _ = @import("core/registry.zig");
+    _ = @import("core/slab.zig");
 }

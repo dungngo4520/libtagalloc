@@ -173,6 +173,17 @@ pub fn build(b: *std.Build) void {
         "Build tagalloc-stress",
     );
 
+    const bench_slab_step = addInstalledExe(
+        b,
+        "tagalloc-bench-slab",
+        "examples/bench_slab.zig",
+        target,
+        optimize,
+        .{ .name = "tagalloc", .module = root_mod },
+        "bench-slab",
+        "Build tagalloc-bench-slab",
+    );
+
     const fixture_step = addInstalledExe(
         b,
         "tagalloc-fixture",
@@ -188,6 +199,7 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(demo_zig_install);
     examples_step.dependOn(demo_cpp_install);
     examples_step.dependOn(stress_step);
+    examples_step.dependOn(bench_slab_step);
     examples_step.dependOn(fixture_step);
 
     // Alias: 'example' (singular) → 'examples' (plural) for convenience.

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const os = @import("../platform/os.zig");
 const arena = @import("arena.zig");
+const slab = @import("slab.zig");
 const registry = @import("registry.zig");
 
 pub const DefaultAlign64: usize = 16;
@@ -24,6 +25,7 @@ const AllocHeader = extern struct {
 
 const HDR_KIND_MMAP: u8 = 0;
 const HDR_KIND_ARENA: u8 = 1;
+const HDR_KIND_SLAB: u8 = 2;
 
 var g_arena: arena.Arena = .{};
 
@@ -43,6 +45,49 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     const hdr_size = @sizeOf(AllocHeader);
     const prefix_size = @sizeOf(usize);
     const effective_alignment = try normalizeAlignment(alignment);
+
+    if (alignment == 0 or effective_alignment <= defaultAlign()) {
+        const overhead = hdr_size + prefix_size;
+        if (slab.sizeToClassIndex(size)) |class_idx| {
+            const class_size = slab.SlabSizeClasses[class_idx];
+            if (size + overhead <= class_size) {
+                const slot = slab.allocSlab(class_size) catch {
+                    // Slab failed; fall through to arena/mmap
+                    return allocFallback(tag, size, effective_alignment);
+                };
+
+                const hdr_addr = @intFromPtr(slot);
+                const hdr: *AllocHeader = @ptrFromInt(hdr_addr);
+                hdr.* = .{
+                    .backing_base = 0,
+                    .backing_len = class_size,
+                    .user_size = size,
+                    .tag = tag,
+                    .align_log2 = @intCast(@ctz(effective_alignment)),
+                    .kind = HDR_KIND_SLAB,
+                    .arena_order = 0,
+                    .reserved0 = 0,
+                };
+
+                const after_hdr = hdr_addr + hdr_size;
+                const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
+                const prefix_addr = user_addr - prefix_size;
+                const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
+                prefix_ptr.* = @intFromPtr(hdr);
+
+                const user_ptr: [*]u8 = @ptrFromInt(user_addr);
+                registry.noteAlloc(tag, size);
+                return user_ptr;
+            }
+        }
+    }
+
+    return allocFallback(tag, size, effective_alignment);
+}
+
+fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
+    const hdr_size = @sizeOf(AllocHeader);
+    const prefix_size = @sizeOf(usize);
 
     var raw_needed = try std.math.add(usize, hdr_size, prefix_size);
     raw_needed = try std.math.add(usize, raw_needed, size);
@@ -134,7 +179,9 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
 
     registry.noteFree(hdr.tag, hdr.user_size);
 
-    if (hdr.kind == HDR_KIND_ARENA) {
+    if (hdr.kind == HDR_KIND_SLAB) {
+        slab.freeSlab(@ptrFromInt(hdr_addr));
+    } else if (hdr.kind == HDR_KIND_ARENA) {
         g_arena.freeBlock(hdr_addr, hdr.arena_order);
     } else {
         os.osMunmap(@ptrFromInt(hdr.backing_base), hdr.backing_len);
