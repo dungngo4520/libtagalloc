@@ -33,4 +33,5 @@ test {
     _ = @import("core/allocator.zig");
     _ = @import("core/registry.zig");
     _ = @import("core/slab.zig");
+    _ = @import("adapters/allocator.zig");
 }

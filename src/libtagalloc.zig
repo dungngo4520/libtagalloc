@@ -4,6 +4,8 @@ const abi = @import("abi");
 const allocator = @import("core/allocator.zig");
 const registry = @import("core/registry.zig");
 
+pub const TaggedAllocator = @import("adapters/allocator.zig").TaggedAllocator;
+
 pub const TAGALLOC_ABI_VERSION = abi.TAGALLOC_ABI_VERSION;
 pub const TAGALLOC_REGISTRY_MAGIC = abi.TAGALLOC_REGISTRY_MAGIC;
 
