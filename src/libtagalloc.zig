@@ -1,8 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const TAGALLOC_ABI_VERSION: u32 = 1;
-pub const TAGALLOC_REGISTRY_MAGIC: u64 = 0x5441_4741_4C4C_4F43; // "TAGALLOC"
+const abi = @import("abi.zig");
+
+pub const TAGALLOC_ABI_VERSION = abi.TAGALLOC_ABI_VERSION;
+pub const TAGALLOC_REGISTRY_MAGIC = abi.TAGALLOC_REGISTRY_MAGIC;
+
+pub const RegistryV1 = abi.RegistryV1;
+pub const AggSegmentV1 = abi.AggSegmentV1;
+pub const AggEntryV1 = abi.AggEntryV1;
+
+pub const V1_HEADER_MIN_SIZE = abi.V1_HEADER_MIN_SIZE;
+pub const V1_SEGMENT_HEADER_SIZE = abi.V1_SEGMENT_HEADER_SIZE;
+pub const V1_ENTRY_MIN_SIZE = abi.V1_ENTRY_MIN_SIZE;
 
 pub const DefaultAlign64: usize = 16;
 pub const DefaultAlign32: usize = 8;
@@ -10,50 +20,6 @@ pub const DefaultAlign32: usize = 8;
 fn defaultAlign() usize {
     return if (@sizeOf(usize) == 8) DefaultAlign64 else DefaultAlign32;
 }
-
-pub const RegistryV1 = extern struct {
-    magic: u64,
-    abi_version: u32,
-    header_size: u32,
-
-    ptr_size: u8,
-    endianness: u8, // 1=little, 2=big
-    reserved0: u16,
-
-    publish_seq: u64, // even=stable, odd=writer in progress
-    flags: u64,
-
-    first_segment: usize, // *const AggSegmentV1
-
-    overflow_tag: u32,
-    reserved1: u32,
-
-    tag_mismatch_count: u64,
-    dropped_tag_count: u64,
-};
-
-pub const AggSegmentV1 = extern struct {
-    segment_size: u32,
-    entry_stride: u16,
-    entry_count: u16,
-    next_segment: usize, // *const AggSegmentV1
-    reserved0: u64,
-    // entries follow
-};
-
-pub const AggEntryV1 = extern struct {
-    tag: u32,
-    reserved0: u32, // internal state (0=empty, 1=used)
-
-    alloc_count: u64,
-    alloc_bytes: u64,
-    free_count: u64,
-    free_bytes: u64,
-};
-
-pub const V1_HEADER_MIN_SIZE: usize = @sizeOf(RegistryV1);
-pub const V1_SEGMENT_HEADER_SIZE: usize = @sizeOf(AggSegmentV1);
-pub const V1_ENTRY_MIN_SIZE: usize = @sizeOf(AggEntryV1);
 
 const FLAG_DEGRADED: u64 = 1 << 0;
 const FLAG_COUNTER_OVERFLOW: u64 = 1 << 1;
