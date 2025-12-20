@@ -4,6 +4,7 @@ const os = @import("../platform/os.zig");
 const arena = @import("arena.zig");
 const slab = @import("slab.zig");
 const registry = @import("registry.zig");
+const hardening = @import("../debug/hardening.zig");
 
 pub const DefaultAlign64: usize = 16;
 pub const DefaultAlign32: usize = 8;
@@ -27,7 +28,60 @@ const HDR_KIND_MMAP: u8 = 0;
 const HDR_KIND_ARENA: u8 = 1;
 const HDR_KIND_SLAB: u8 = 2;
 
+const HDR_STATE_LIVE: u8 = 0;
+const HDR_STATE_FREED: u8 = 0xDE;
+
 var g_arena: arena.Arena = .{};
+
+const FreeRecord = struct {
+    kind: u8,
+    hdr_addr: usize,
+    backing_base: usize,
+    backing_len: usize,
+    arena_order: u8,
+    user_ptr: [*]u8,
+    user_size: usize,
+};
+
+const QuarantineCapacity: usize = 1024;
+var g_quarantine_lock: std.Thread.Mutex = .{};
+var g_quarantine: [QuarantineCapacity]?FreeRecord = [_]?FreeRecord{null} ** QuarantineCapacity;
+var g_quarantine_head: usize = 0;
+var g_quarantine_len: usize = 0;
+
+fn quarantinePush(rec: FreeRecord) void {
+    if (!hardening.enabled()) {
+        actuallyFree(rec);
+        return;
+    }
+
+    var to_free: ?FreeRecord = null;
+
+    g_quarantine_lock.lock();
+    if (g_quarantine_len == QuarantineCapacity) {
+        to_free = g_quarantine[g_quarantine_head].?;
+        g_quarantine[g_quarantine_head] = null;
+        g_quarantine_head = (g_quarantine_head + 1) % QuarantineCapacity;
+        g_quarantine_len -= 1;
+    }
+
+    const tail_idx = (g_quarantine_head + g_quarantine_len) % QuarantineCapacity;
+    g_quarantine[tail_idx] = rec;
+    g_quarantine_len += 1;
+    g_quarantine_lock.unlock();
+
+    if (to_free) |old| actuallyFree(old);
+}
+
+fn actuallyFree(rec: FreeRecord) void {
+    if (rec.kind == HDR_KIND_SLAB) {
+        slab.freeSlab(@ptrFromInt(rec.hdr_addr));
+    } else if (rec.kind == HDR_KIND_ARENA) {
+        g_arena.freeBlock(rec.hdr_addr, rec.arena_order);
+    } else {
+        os.osMunmap(@ptrFromInt(rec.backing_base), rec.backing_len);
+    }
+}
 
 fn normalizeAlignment(alignment: usize) !usize {
     const min_align = defaultAlign();
@@ -45,9 +99,10 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     const hdr_size = @sizeOf(AllocHeader);
     const prefix_size = @sizeOf(usize);
     const effective_alignment = try normalizeAlignment(alignment);
+    const tail_bytes = hardening.tailBytes();
 
     if (alignment == 0 or effective_alignment <= defaultAlign()) {
-        const overhead = hdr_size + prefix_size;
+        const overhead = hdr_size + prefix_size + tail_bytes;
         if (slab.sizeToClassIndex(size)) |class_idx| {
             const class_size = slab.SlabSizeClasses[class_idx];
             if (size + overhead <= class_size) {
@@ -66,7 +121,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                     .align_log2 = @intCast(@ctz(effective_alignment)),
                     .kind = HDR_KIND_SLAB,
                     .arena_order = 0,
-                    .reserved0 = 0,
+                    .reserved0 = HDR_STATE_LIVE,
                 };
 
                 const after_hdr = hdr_addr + hdr_size;
@@ -76,6 +131,8 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                 prefix_ptr.* = @intFromPtr(hdr);
 
                 const user_ptr: [*]u8 = @ptrFromInt(user_addr);
+                hardening.poisonAlloc(user_ptr, size);
+                hardening.writeTailCanary(user_ptr, size);
                 registry.noteAlloc(tag, size);
                 return user_ptr;
             }
@@ -91,6 +148,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
 
     var raw_needed = try std.math.add(usize, hdr_size, prefix_size);
     raw_needed = try std.math.add(usize, raw_needed, size);
+    raw_needed = try std.math.add(usize, raw_needed, hardening.tailBytes());
     raw_needed = try std.math.add(usize, raw_needed, effective_alignment);
 
     const arena_order = arena.sizeToArenaOrder(raw_needed);
@@ -114,7 +172,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
             .align_log2 = @intCast(@ctz(effective_alignment)),
             .kind = HDR_KIND_ARENA,
             .arena_order = ord,
-            .reserved0 = 0,
+            .reserved0 = HDR_STATE_LIVE,
         };
 
         const after_hdr = hdr_addr + hdr_size;
@@ -123,6 +181,8 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
         const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
         prefix_ptr.* = @intFromPtr(hdr);
         user_ptr = @ptrFromInt(user_addr);
+        hardening.poisonAlloc(user_ptr, size);
+        hardening.writeTailCanary(user_ptr, size);
         used_arena = true;
         break :blk;
     } else {
@@ -145,7 +205,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
             .align_log2 = @intCast(@ctz(effective_alignment)),
             .kind = HDR_KIND_MMAP,
             .arena_order = 0,
-            .reserved0 = 0,
+            .reserved0 = HDR_STATE_LIVE,
         };
 
         const after_hdr = hdr_addr + hdr_size;
@@ -154,6 +214,8 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
         const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
         prefix_ptr.* = @intFromPtr(hdr);
         user_ptr = @ptrFromInt(user_addr);
+        hardening.poisonAlloc(user_ptr, size);
+        hardening.writeTailCanary(user_ptr, size);
     }
 
     registry.noteAlloc(tag, size);
@@ -179,13 +241,37 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
 
     registry.noteFree(hdr.tag, hdr.user_size);
 
-    if (hdr.kind == HDR_KIND_SLAB) {
-        slab.freeSlab(@ptrFromInt(hdr_addr));
-    } else if (hdr.kind == HDR_KIND_ARENA) {
-        g_arena.freeBlock(hdr_addr, hdr.arena_order);
-    } else {
-        os.osMunmap(@ptrFromInt(hdr.backing_base), hdr.backing_len);
+    if (hardening.enabled()) {
+        if (hdr.reserved0 == HDR_STATE_FREED) {
+            hardening.hardPanic("tagalloc: double free detected");
+        }
+        if (!hardening.checkTailCanary(ptr, hdr.user_size)) {
+            hardening.hardPanic("tagalloc: tail canary corrupted (buffer overrun)");
+        }
+        hardening.poisonFree(ptr, hdr.user_size);
+        hdr.reserved0 = HDR_STATE_FREED;
+
+        quarantinePush(.{
+            .kind = hdr.kind,
+            .hdr_addr = hdr_addr,
+            .backing_base = hdr.backing_base,
+            .backing_len = hdr.backing_len,
+            .arena_order = hdr.arena_order,
+            .user_ptr = ptr,
+            .user_size = hdr.user_size,
+        });
+        return;
     }
+
+    actuallyFree(.{
+        .kind = hdr.kind,
+        .hdr_addr = hdr_addr,
+        .backing_base = hdr.backing_base,
+        .backing_len = hdr.backing_len,
+        .arena_order = hdr.arena_order,
+        .user_ptr = ptr,
+        .user_size = hdr.user_size,
+    });
 }
 
 pub fn alloc(tag: u32, size: usize) ![*]u8 {
