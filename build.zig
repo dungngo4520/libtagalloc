@@ -9,8 +9,8 @@ fn addInstalledExe(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     import: ?Import,
-    step_name: []const u8,
-    step_desc: []const u8,
+    step_name: ?[]const u8,
+    step_desc: ?[]const u8,
 ) *std.Build.Step {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path(root_source),
@@ -25,10 +25,15 @@ fn addInstalledExe(
     });
 
     const install_exe = b.addInstallArtifact(exe, .{});
-    const step = b.step(step_name, step_desc);
-    step.dependOn(&install_exe.step);
 
-    return step;
+    if (step_name) |sn| {
+        const sd = step_desc orelse "Build";
+        const step = b.step(sn, sd);
+        step.dependOn(&install_exe.step);
+        return step;
+    }
+
+    return &install_exe.step;
 }
 
 fn addInstalledCppExe(
@@ -38,8 +43,8 @@ fn addInstalledCppExe(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tagalloc_lib: *std.Build.Step.Compile,
-    step_name: []const u8,
-    step_desc: []const u8,
+    step_name: ?[]const u8,
+    step_desc: ?[]const u8,
 ) *std.Build.Step {
     const exe_mod = b.createModule(.{
         .root_source_file = null,
@@ -63,10 +68,15 @@ fn addInstalledCppExe(
     exe.linkLibrary(tagalloc_lib);
 
     const install_exe = b.addInstallArtifact(exe, .{});
-    const step = b.step(step_name, step_desc);
-    step.dependOn(&install_exe.step);
 
-    return step;
+    if (step_name) |sn| {
+        const sd = step_desc orelse "Build";
+        const step = b.step(sn, sd);
+        step.dependOn(&install_exe.step);
+        return step;
+    }
+
+    return &install_exe.step;
 }
 
 fn addUnitTests(
@@ -126,31 +136,31 @@ pub fn build(b: *std.Build) void {
         "Build tagalloc-poolreader",
     );
 
-    const demo_zig_step = addInstalledExe(
+    const demo_zig_install = addInstalledExe(
         b,
         "tagalloc-demo-zig",
         "examples/demo.zig",
         target,
         optimize,
         .{ .name = "tagalloc", .module = root_mod },
-        "demo-zig",
-        "Build tagalloc-demo-zig",
+        null,
+        null,
     );
 
-    const demo_cpp_step = addInstalledCppExe(
+    const demo_cpp_install = addInstalledCppExe(
         b,
         "tagalloc-demo-cpp",
         "examples/demo.cpp",
         target,
         optimize,
         tagalloc_lib,
-        "demo-cpp",
-        "Build tagalloc-demo-cpp",
+        null,
+        null,
     );
 
     const demo_step = b.step("demo", "Build all demos");
-    demo_step.dependOn(demo_zig_step);
-    demo_step.dependOn(demo_cpp_step);
+    demo_step.dependOn(demo_zig_install);
+    demo_step.dependOn(demo_cpp_install);
 
     const stress_step = addInstalledExe(
         b,
@@ -175,10 +185,14 @@ pub fn build(b: *std.Build) void {
     );
 
     const examples_step = b.step("examples", "Build all examples");
-    examples_step.dependOn(demo_zig_step);
-    examples_step.dependOn(demo_cpp_step);
+    examples_step.dependOn(demo_zig_install);
+    examples_step.dependOn(demo_cpp_install);
     examples_step.dependOn(stress_step);
     examples_step.dependOn(fixture_step);
+
+    // Alias: 'example' (singular) → 'examples' (plural) for convenience.
+    const example_alias = b.step("example", "Build all examples (alias)");
+    example_alias.dependOn(examples_step);
 
     addUnitTests(b, target, optimize, abi_mod);
 }

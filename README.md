@@ -5,57 +5,29 @@ Inspired by the Windows API `ExAllocatePoolWithTag`.
 
 ## Build
 
-```bash
-zig build --summary all
+```sh
+zig build
+zig build test
 ```
 
-Outputs:
+Outputs: `zig-out/lib/libtagalloc.{a,h}`, `zig-out/bin/*`
 
-- `zig-out/lib/libtagalloc.a`
-- `zig-out/lib/libtagalloc.h`
+## Usage
 
-## Status / scope
-
-- Current backend is Linux-only and uses `mmap/munmap` (no libc heap dependency).
-
-## Tests
-
-Default unit tests:
-
-```bash
-zig build test --summary all
-```
-
-## Stress / benchmark
-
-Build and run the stress/benchmark example:
-
-```bash
-zig build stress --summary all
-./zig-out/bin/tagalloc-stress
-```
-
-Optional args: `./zig-out/bin/tagalloc-stress <threads> <iterations> <runs>`
-
-## Demo + poolreader
-
-Build Zig demo:
-
-```bash
-zig build demo-zig --summary all
+```sh
+# Run demo
+zig build demo
 ./zig-out/bin/tagalloc-demo-zig
-```
 
-Build C++ demo:
-
-```bash
-zig build demo-cpp --summary all
-./zig-out/bin/tagalloc-demo-cpp
-```
-
-In another terminal, build and run poolreader (may require elevated privileges):
-
-```bash
-zig build poolreader --summary all
+# Inspect live process
+zig build poolreader
 ./zig-out/bin/tagalloc-poolreader <pid>
+./zig-out/bin/tagalloc-poolreader <pid> --scan  # fallback
+```
+
+## Benchmark
+
+```sh
+zig build stress
+./zig-out/bin/tagalloc-stress [threads] [iterations] [runs]
 ```
