@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const abi = @import("abi");
+const elf = std.elf;
 
 const ENTRY_USED: u32 = 1;
 
@@ -33,7 +34,7 @@ pub fn main() !void {
     const maps = try readMaps(allocator, pid);
     defer freeMaps(allocator, maps);
 
-    const registry_addr = try findRegistryAddr(pid, maps);
+    const registry_addr = try findRegistryAddr(allocator, pid, maps);
     const reg = try readRegistryStable(pid, registry_addr);
 
     const stdout = std.fs.File.stdout();
@@ -114,7 +115,9 @@ fn readMaps(allocator: std.mem.Allocator, pid: i32) ![]MapEntry {
     return try maps_list.toOwnedSlice(allocator);
 }
 
-fn findRegistryAddr(pid: i32, maps: []const MapEntry) !usize {
+fn findRegistryAddr(allocator: std.mem.Allocator, pid: i32, maps: []const MapEntry) !usize {
+    if (try findRegistryAddrBySymbol(allocator, pid, maps)) |addr| return addr;
+
     const magic = abi.TAGALLOC_REGISTRY_MAGIC;
     const magic_bytes = std.mem.asBytes(&magic);
 
@@ -166,6 +169,194 @@ fn findRegistryAddr(pid: i32, maps: []const MapEntry) !usize {
     if (saw_no_such_process) return error.NoSuchProcess;
     if (saw_permission_denied) return error.PermissionDenied;
     return error.RegistryNotFound;
+}
+
+fn findRegistryAddrBySymbol(allocator: std.mem.Allocator, pid: i32, maps: []const MapEntry) !?usize {
+    // Preferred method: ELF symbol lookup. This avoids scanning process memory.
+    // Works best when `g_tagalloc_registry` is present in `.dynsym` or `.symtab`.
+    const sym_name = "g_tagalloc_registry";
+
+    const exe_path = readProcExePath(allocator, pid) catch |err| switch (err) {
+        error.NoSuchProcess => return error.NoSuchProcess,
+        error.PermissionDenied => return error.PermissionDenied,
+        else => return null,
+    };
+    defer allocator.free(exe_path);
+
+    if (try findRegistryAddrInModuleBySymbol(allocator, pid, maps, exe_path, sym_name)) |addr| return addr;
+
+    // Fallback: try other file-backed executable mappings (shared libs).
+    // Keep this bounded; we only look at mapped modules with offset==0.
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer seen.deinit(allocator);
+
+    for (maps) |m| {
+        if (m.perms[2] != 'x') continue;
+        if (m.offset != 0) continue;
+        const p = m.path orelse continue;
+        if (std.mem.startsWith(u8, p, "[") and std.mem.endsWith(u8, p, "]")) continue;
+
+        const norm = normalizeMapsPath(p);
+        if (seen.contains(norm)) continue;
+        try seen.put(allocator, norm, {});
+
+        if (std.mem.eql(u8, norm, exe_path)) continue;
+        if (try findRegistryAddrInModuleBySymbol(allocator, pid, maps, norm, sym_name)) |addr| return addr;
+    }
+
+    return null;
+}
+
+fn findRegistryAddrInModuleBySymbol(
+    allocator: std.mem.Allocator,
+    pid: i32,
+    maps: []const MapEntry,
+    module_path: []const u8,
+    symbol_name: []const u8,
+) !?usize {
+    const base = findModuleBaseAddr(maps, module_path) orelse return null;
+    const sym = parseElfForSymbolValue(allocator, module_path, symbol_name) catch return null;
+
+    const remote_addr: usize = switch (sym.elf_type) {
+        .EXEC => @intCast(sym.value),
+        .DYN => base + @as(usize, @intCast(sym.value)),
+        else => return null,
+    };
+
+    // Validate quickly by reading the registry header.
+    const reg = readRemoteType(pid, remote_addr, abi.RegistryV1) catch |err| switch (err) {
+        error.PermissionDenied => return error.PermissionDenied,
+        error.NoSuchProcess => return error.NoSuchProcess,
+        else => return null,
+    };
+    if (reg.magic != abi.TAGALLOC_REGISTRY_MAGIC) return null;
+    if (reg.abi_version != abi.TAGALLOC_ABI_VERSION) return null;
+    if (reg.header_size < @sizeOf(abi.RegistryV1)) return null;
+    if (reg.ptr_size != @sizeOf(usize)) return null;
+    if (reg.endianness != 1) return null;
+
+    return remote_addr;
+}
+
+fn findModuleBaseAddr(maps: []const MapEntry, module_path: []const u8) ?usize {
+    // For ET_DYN binaries/libraries (PIE), the mapping with file offset 0 is the base.
+    // For ET_EXEC, st_value is absolute, so base doesn't matter (but we still validate mapping).
+    var best: ?usize = null;
+    for (maps) |m| {
+        if (m.offset != 0) continue;
+        const p = m.path orelse continue;
+        if (!std.mem.eql(u8, normalizeMapsPath(p), module_path)) continue;
+
+        if (best == null or m.start < best.?) best = m.start;
+    }
+    return best;
+}
+
+fn normalizeMapsPath(path: []const u8) []const u8 {
+    // /proc/<pid>/maps may append " (deleted)".
+    const suffix = " (deleted)";
+    if (std.mem.endsWith(u8, path, suffix)) {
+        return path[0 .. path.len - suffix.len];
+    }
+    return path;
+}
+
+fn readProcExePath(allocator: std.mem.Allocator, pid: i32) ![]u8 {
+    // Readlink /proc/<pid>/exe.
+    var link_path_buf: [64]u8 = undefined;
+    const link_path = try std.fmt.bufPrint(&link_path_buf, "/proc/{d}/exe", .{pid});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const out = std.posix.readlink(link_path, buf[0..]) catch |err| switch (err) {
+        error.FileNotFound => return error.NoSuchProcess,
+        error.AccessDenied => return error.PermissionDenied,
+        else => return err,
+    };
+    return try allocator.dupe(u8, out);
+}
+
+const FoundSymbol = struct {
+    elf_type: elf.ET,
+    value: u64,
+};
+
+fn parseElfForSymbolValue(allocator: std.mem.Allocator, file_path: []const u8, symbol_name: []const u8) !FoundSymbol {
+    if (@sizeOf(usize) != 8) return error.Unsupported;
+
+    var file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+
+    // Keep a sanity limit; binaries should be well below this.
+    const data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer allocator.free(data);
+
+    if (data.len < @sizeOf(elf.Elf64_Ehdr)) return error.BadElf;
+    const hdr = std.mem.bytesAsValue(elf.Elf64_Ehdr, data[0..@sizeOf(elf.Elf64_Ehdr)]).*;
+
+    if (!std.mem.eql(u8, hdr.e_ident[0..4], elf.MAGIC)) return error.BadElf;
+    if (hdr.e_ident[elf.EI_CLASS] != elf.ELFCLASS64) return error.BadElf;
+    if (hdr.e_ident[elf.EI_DATA] != elf.ELFDATA2LSB) return error.BadElf;
+
+    const shoff: usize = @intCast(hdr.e_shoff);
+    const shentsize: usize = @intCast(hdr.e_shentsize);
+    const shnum: usize = @intCast(hdr.e_shnum);
+    if (shoff == 0 or shentsize < @sizeOf(elf.Elf64_Shdr) or shnum == 0) return error.BadElf;
+    const sh_bytes_needed = try std.math.mul(usize, shentsize, shnum);
+    if (shoff + sh_bytes_needed > data.len) return error.BadElf;
+
+    // Load section headers.
+    var shdrs = try allocator.alloc(elf.Elf64_Shdr, shnum);
+    defer allocator.free(shdrs);
+    {
+        var i: usize = 0;
+        while (i < shnum) : (i += 1) {
+            const off = shoff + i * shentsize;
+            shdrs[i] = std.mem.bytesAsValue(elf.Elf64_Shdr, data[off .. off + @sizeOf(elf.Elf64_Shdr)]).*;
+        }
+    }
+
+    // Helper to search a symbol table section.
+    const want = symbol_name;
+    const symtab_types = [_]u32{ elf.SHT_SYMTAB, elf.SHT_DYNSYM };
+    for (symtab_types) |sym_type| {
+        var i: usize = 0;
+        while (i < shnum) : (i += 1) {
+            const sh = shdrs[i];
+            if (sh.sh_type != sym_type) continue;
+            if (sh.sh_entsize == 0 or sh.sh_size == 0) continue;
+            if (sh.sh_entsize < @sizeOf(elf.Elf64_Sym)) continue;
+
+            const link: usize = @intCast(sh.sh_link);
+            if (link >= shnum) continue;
+            const str_sh = shdrs[link];
+            if (str_sh.sh_type != elf.SHT_STRTAB) continue;
+
+            const sym_off: usize = @intCast(sh.sh_offset);
+            const sym_size: usize = @intCast(sh.sh_size);
+            if (sym_off + sym_size > data.len) continue;
+
+            const str_off: usize = @intCast(str_sh.sh_offset);
+            const str_size: usize = @intCast(str_sh.sh_size);
+            if (str_off + str_size > data.len) continue;
+            const strtab = data[str_off .. str_off + str_size];
+
+            const count: usize = @intCast(sym_size / sh.sh_entsize);
+            var si: usize = 0;
+            while (si < count) : (si += 1) {
+                const off = sym_off + si * @as(usize, @intCast(sh.sh_entsize));
+                const sym = std.mem.bytesAsValue(elf.Elf64_Sym, data[off .. off + @sizeOf(elf.Elf64_Sym)]).*;
+                if (sym.st_name == 0) continue;
+                const name_off: usize = @intCast(sym.st_name);
+                if (name_off >= strtab.len) continue;
+                const name = std.mem.sliceTo(strtab[name_off..], 0);
+                if (std.mem.eql(u8, name, want)) {
+                    return .{ .elf_type = hdr.e_type, .value = @intCast(sym.st_value) };
+                }
+            }
+        }
+    }
+
+    return error.SymbolNotFound;
 }
 
 fn scanForMagicInRange(pid: i32, start: usize, end: usize, magic_bytes: *const [8]u8) !?usize {
