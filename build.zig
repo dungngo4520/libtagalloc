@@ -152,5 +152,16 @@ pub fn build(b: *std.Build) void {
     demo_step.dependOn(demo_zig_step);
     demo_step.dependOn(demo_cpp_step);
 
+    _ = addInstalledExe(
+        b,
+        "tagalloc-stress",
+        "examples/stress.zig",
+        target,
+        optimize,
+        .{ .name = "tagalloc", .module = root_mod },
+        "stress",
+        "Build tagalloc-stress",
+    );
+
     addUnitTests(b, target, optimize, abi_mod);
 }

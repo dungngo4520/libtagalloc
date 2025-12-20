@@ -26,11 +26,16 @@ Default unit tests:
 zig build test --summary all
 ```
 
-The multithread stress test is **opt-in**:
+## Stress / benchmark
+
+Build and run the stress/benchmark example:
 
 ```bash
-TAGALLOC_STRESS=1 zig build test --summary all
+zig build stress --summary all
+./zig-out/bin/tagalloc-stress
 ```
+
+Optional args: `./zig-out/bin/tagalloc-stress <threads> <iterations> <runs>`
 
 ## Demo + poolreader
 

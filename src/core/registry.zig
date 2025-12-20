@@ -69,6 +69,11 @@ pub export var g_tagalloc_registry: RegistryV1 = .{
     .dropped_tag_count = 0,
 };
 
+pub fn getRegistry() *const RegistryV1 {
+    ensureInit();
+    return &g_tagalloc_registry;
+}
+
 fn isLittleEndian() bool {
     return builtin.cpu.arch.endian() == .little;
 }
