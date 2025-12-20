@@ -33,9 +33,12 @@ pub fn main() !void {
     }
 
     try stdout.writeAll(
-        "fixture ready; run poolreader now (sleeping 3s)\n",
+        "fixture ready; run poolreader now (press Enter to continue)\n",
     );
-    std.Thread.sleep(3 * std.time.ns_per_s);
+
+    // Block until any input byte (typically Enter). EOF also continues.
+    var buf: [1]u8 = undefined;
+    _ = std.fs.File.stdin().read(buf[0..]) catch {};
 
     // Phase 3: free the kept allocations.
     for (kept) |p_opt| {
