@@ -1,127 +1,5 @@
 const std = @import("std");
 
-const Import = struct { name: []const u8, module: *std.Build.Module };
-
-fn addInstalledExe(
-    b: *std.Build,
-    name: []const u8,
-    root_source: []const u8,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    import: ?Import,
-    step_name: ?[]const u8,
-    step_desc: ?[]const u8,
-) *std.Build.Step {
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path(root_source),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (import) |imp| exe_mod.addImport(imp.name, imp.module);
-
-    const exe = b.addExecutable(.{
-        .name = name,
-        .root_module = exe_mod,
-    });
-
-    const install_exe = b.addInstallArtifact(exe, .{});
-
-    if (step_name) |sn| {
-        const sd = step_desc orelse "Build";
-        const step = b.step(sn, sd);
-        step.dependOn(&install_exe.step);
-        return step;
-    }
-
-    return &install_exe.step;
-}
-
-fn addInstalledCppExe(
-    b: *std.Build,
-    name: []const u8,
-    root_source: []const u8,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    tagalloc_lib: *std.Build.Step.Compile,
-    step_name: ?[]const u8,
-    step_desc: ?[]const u8,
-) *std.Build.Step {
-    const exe_mod = b.createModule(.{
-        .root_source_file = null,
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = name,
-        .root_module = exe_mod,
-    });
-
-    exe.addCSourceFile(.{
-        .file = b.path(root_source),
-        .flags = &.{"-std=c++17"},
-        .language = .cpp,
-    });
-
-    exe.linkLibC();
-    exe.linkLibCpp();
-    exe.linkLibrary(tagalloc_lib);
-
-    const install_exe = b.addInstallArtifact(exe, .{});
-
-    if (step_name) |sn| {
-        const sd = step_desc orelse "Build";
-        const step = b.step(sn, sd);
-        step.dependOn(&install_exe.step);
-        return step;
-    }
-
-    return &install_exe.step;
-}
-
-fn addUnitTests(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    abi_mod: *std.Build.Module,
-    root_mod: *std.Build.Module,
-) void {
-    const test_step = b.step("test", "Run library tests");
-
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addImport("abi", abi_mod);
-
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-
-    const poolreader_mod = b.createModule(.{
-        .root_source_file = b.path("tools/poolreader_lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    poolreader_mod.addImport("abi", abi_mod);
-
-    const integration_mod = b.createModule(.{
-        .root_source_file = b.path("test/poolreader_integration.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    integration_mod.addImport("abi", abi_mod);
-    integration_mod.addImport("tagalloc", root_mod);
-    integration_mod.addImport("poolreader", poolreader_mod);
-
-    const integration_exe = b.addExecutable(.{
-        .name = "tagalloc-integration",
-        .root_module = integration_mod,
-    });
-
-    test_step.dependOn(&b.addRunArtifact(integration_exe).step);
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -149,86 +27,54 @@ pub fn build(b: *std.Build) void {
     b.installLibFile("include/libtagalloc.h", "libtagalloc.h");
     b.installArtifact(tagalloc_lib);
 
-    _ = addInstalledExe(
-        b,
-        "tagalloc-poolreader",
-        "tools/poolreader.zig",
-        target,
-        optimize,
-        .{ .name = "abi", .module = abi_mod },
-        "poolreader",
-        "Build tagalloc-poolreader",
-    );
+    const test_step = b.step("test", "Run tests");
+    {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        test_mod.addImport("abi", abi_mod);
 
-    const demo_zig_install = addInstalledExe(
-        b,
-        "tagalloc-demo-zig",
-        "examples/demo.zig",
-        target,
-        optimize,
-        .{ .name = "tagalloc", .module = root_mod },
-        null,
-        null,
-    );
+        const unit_tests = b.addTest(.{ .root_module = test_mod });
+        test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    }
 
-    const demo_cpp_install = addInstalledCppExe(
-        b,
-        "tagalloc-demo-cpp",
-        "examples/demo.cpp",
-        target,
-        optimize,
-        tagalloc_lib,
-        null,
-        null,
-    );
+    // Poolreader tool.
+    const poolreader_step = b.step("poolreader", "Build poolreader");
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("tools/poolreader.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("abi", abi_mod);
+        const exe = b.addExecutable(.{ .name = "tagalloc-poolreader", .root_module = mod });
+        poolreader_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
 
-    const demo_step = b.step("demo", "Build all demos");
-    demo_step.dependOn(demo_zig_install);
-    demo_step.dependOn(demo_cpp_install);
+    // Demo programs.
+    const demo_step = b.step("demo", "Build demos");
+    {
+        const demo_zig_mod = b.createModule(.{
+            .root_source_file = b.path("examples/demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        demo_zig_mod.addImport("tagalloc", root_mod);
+        const demo_zig = b.addExecutable(.{ .name = "tagalloc-demo-zig", .root_module = demo_zig_mod });
+        demo_step.dependOn(&b.addInstallArtifact(demo_zig, .{}).step);
 
-    const stress_step = addInstalledExe(
-        b,
-        "tagalloc-stress",
-        "examples/stress.zig",
-        target,
-        optimize,
-        .{ .name = "tagalloc", .module = root_mod },
-        "stress",
-        "Build tagalloc-stress",
-    );
-
-    const bench_slab_step = addInstalledExe(
-        b,
-        "tagalloc-bench-slab",
-        "examples/bench_slab.zig",
-        target,
-        optimize,
-        .{ .name = "tagalloc", .module = root_mod },
-        "bench-slab",
-        "Build tagalloc-bench-slab",
-    );
-
-    const fixture_step = addInstalledExe(
-        b,
-        "tagalloc-fixture",
-        "examples/fixture.zig",
-        target,
-        optimize,
-        .{ .name = "tagalloc", .module = root_mod },
-        "fixture",
-        "Build tagalloc-fixture",
-    );
-
-    const examples_step = b.step("examples", "Build all examples");
-    examples_step.dependOn(demo_zig_install);
-    examples_step.dependOn(demo_cpp_install);
-    examples_step.dependOn(stress_step);
-    examples_step.dependOn(bench_slab_step);
-    examples_step.dependOn(fixture_step);
-
-    // Alias: 'example' (singular) → 'examples' (plural) for convenience.
-    const example_alias = b.step("example", "Build all examples (alias)");
-    example_alias.dependOn(examples_step);
-
-    addUnitTests(b, target, optimize, abi_mod, root_mod);
+        const demo_cpp_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = optimize,
+        });
+        const demo_cpp = b.addExecutable(.{ .name = "tagalloc-demo-cpp", .root_module = demo_cpp_mod });
+        demo_cpp.addCSourceFile(.{ .file = b.path("examples/demo.cpp"), .flags = &.{"-std=c++17"}, .language = .cpp });
+        demo_cpp.linkLibC();
+        demo_cpp.linkLibCpp();
+        demo_cpp.linkLibrary(tagalloc_lib);
+        demo_step.dependOn(&b.addInstallArtifact(demo_cpp, .{}).step);
+    }
 }

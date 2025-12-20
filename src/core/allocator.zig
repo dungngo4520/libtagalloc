@@ -103,9 +103,10 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
 
     if (alignment == 0 or effective_alignment <= defaultAlign()) {
         const overhead = hdr_size + prefix_size + tail_bytes;
-        if (slab.sizeToClassIndex(size)) |class_idx| {
+        const total_needed = try std.math.add(usize, size, overhead);
+        if (slab.sizeToClassIndex(total_needed)) |class_idx| {
             const class_size = slab.SlabSizeClasses[class_idx];
-            if (size + overhead <= class_size) {
+            if (total_needed <= class_size) {
                 const slot = slab.allocSlab(class_size) catch {
                     // Slab failed; fall through to arena/mmap
                     return allocFallback(tag, size, effective_alignment);
@@ -330,13 +331,56 @@ test "aligned alloc returns properly aligned pointer" {
         const min_align = defaultAlign();
         try std.testing.expect((@intFromPtr(p) % min_align) == 0);
     }
+
+    {
+        const p = try alignedAlloc(tag, 1, 1);
+        defer free(p);
+        const min_align = defaultAlign();
+        try std.testing.expect((@intFromPtr(p) % min_align) == 0);
+    }
 }
 
-test "small allocations use arena backing when available" {
+test "freeWithExpectedTag mismatch bumps registry counter" {
+    const tag_good: u32 = 0x44434241;
+    const tag_bad: u32 = 0x5A595857;
+
+    const reg = registry.getRegistry();
+    const before = @atomicLoad(u64, &reg.tag_mismatch_count, .monotonic);
+
+    const p = try alloc(tag_good, 16);
+    freeWithExpectedTag(p, tag_bad);
+
+    const after = @atomicLoad(u64, &reg.tag_mismatch_count, .monotonic);
+    try std.testing.expectEqual(before + 1, after);
+}
+
+test "realloc handles null and preserves prefix" {
+    const tag: u32 = 0x44434241; // "ABCD"
+
+    // NULL -> alloc
+    const p0 = try realloc(tag, null, 16);
+    defer free(p0);
+
+    const p = try alloc(tag, 16);
+    const buf16: [*]u8 = p;
+    @memset(buf16[0..16], 0xA5);
+
+    const p2 = try realloc(tag, p, 64);
+    defer free(p2);
+
+    const buf64: [*]u8 = p2;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        try std.testing.expectEqual(@as(u8, 0xA5), buf64[i]);
+    }
+}
+
+test "non-slab allocations use arena backing when available" {
     // This test peeks at the internal header via the prefix. It is only intended
     // to validate backend selection, not ABI.
     const tag: u32 = 0x44434241;
-    const p = try alloc(tag, 64);
+    // Use a size that will not fit in the slab size classes once overhead is included.
+    const p = try alloc(tag, 1024);
     defer free(p);
 
     const prefix_size = @sizeOf(usize);
@@ -346,4 +390,17 @@ test "small allocations use arena backing when available" {
 
     // Either arena or mmap is acceptable if arena init fails in the test environment.
     try std.testing.expect(hdr.kind == HDR_KIND_ARENA or hdr.kind == HDR_KIND_MMAP);
+}
+
+test "small allocations use slab backing when eligible" {
+    const tag: u32 = 0x44434241;
+    const p = try alloc(tag, 1);
+    defer free(p);
+
+    const prefix_size = @sizeOf(usize);
+    const prefix_addr = @intFromPtr(p) - prefix_size;
+    const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
+    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+
+    try std.testing.expectEqual(HDR_KIND_SLAB, hdr.kind);
 }
