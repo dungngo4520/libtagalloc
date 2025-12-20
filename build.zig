@@ -84,6 +84,7 @@ fn addUnitTests(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     abi_mod: *std.Build.Module,
+    root_mod: *std.Build.Module,
 ) void {
     const test_step = b.step("test", "Run library tests");
 
@@ -96,6 +97,29 @@ fn addUnitTests(
 
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    const poolreader_mod = b.createModule(.{
+        .root_source_file = b.path("tools/poolreader_lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    poolreader_mod.addImport("abi", abi_mod);
+
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("test/poolreader_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_mod.addImport("abi", abi_mod);
+    integration_mod.addImport("tagalloc", root_mod);
+    integration_mod.addImport("poolreader", poolreader_mod);
+
+    const integration_exe = b.addExecutable(.{
+        .name = "tagalloc-integration",
+        .root_module = integration_mod,
+    });
+
+    test_step.dependOn(&b.addRunArtifact(integration_exe).step);
 }
 
 pub fn build(b: *std.Build) void {
@@ -206,5 +230,5 @@ pub fn build(b: *std.Build) void {
     const example_alias = b.step("example", "Build all examples (alias)");
     example_alias.dependOn(examples_step);
 
-    addUnitTests(b, target, optimize, abi_mod);
+    addUnitTests(b, target, optimize, abi_mod, root_mod);
 }
