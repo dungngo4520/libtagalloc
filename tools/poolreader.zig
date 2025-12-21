@@ -25,13 +25,22 @@ pub fn main() !void {
 
     const pid: i32 = parsed.pid;
 
-    const maps = try pr.readMaps(allocator, pid);
+    const maps = pr.readMaps(allocator, pid) catch |err| {
+        try reportCommonError(std.fs.File.stderr(), pid, err);
+        return err;
+    };
     defer pr.freeMaps(allocator, maps);
 
     const registry_addr = if (parsed.allow_scan)
-        try findRegistryAddrScanFallback(allocator, pid, maps)
+        findRegistryAddrScanFallback(allocator, pid, maps) catch |err| {
+            try reportCommonError(std.fs.File.stderr(), pid, err);
+            return err;
+        }
     else
-        try pr.findRegistryAddr(allocator, pid, maps);
+        pr.findRegistryAddr(allocator, pid, maps) catch |err| {
+            try reportCommonError(std.fs.File.stderr(), pid, err);
+            return err;
+        };
 
     const stdout = std.fs.File.stdout();
 
@@ -67,6 +76,23 @@ pub fn main() !void {
         try stdout.writeAll("\n");
 
         std.Thread.sleep(interval_ns);
+    }
+}
+
+fn reportCommonError(stderr: std.fs.File, pid: i32, err: anyerror) !void {
+    switch (err) {
+        error.PermissionDenied => {
+            try fprint(stderr, "error: permission denied reading pid {d}\n", .{pid});
+        },
+        error.NoSuchProcess => {
+            try fprint(stderr, "error: pid {d} does not exist\n", .{pid});
+        },
+        error.RegistryNotFound => {
+            try fprint(stderr, "error: libtagalloc registry not found in pid {d}\n", .{pid});
+            try fprint(stderr, "hint: ensure the target uses libtagalloc and exports g_tagalloc_registry.\n", .{});
+            try fprint(stderr, "use --scan to enable a bounded RW mapping fallback scan (slower).\n", .{});
+        },
+        else => {},
     }
 }
 
