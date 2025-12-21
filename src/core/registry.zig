@@ -432,3 +432,73 @@ test "counter overflow saturates and sets flag" {
     const flags = @atomicLoad(u64, &g_tagalloc_registry.flags, .monotonic);
     try std.testing.expect((flags & FLAG_COUNTER_OVERFLOW) != 0);
 }
+
+test "registry walk is stable under concurrent tag insertion" {
+    ensureInit();
+
+    const Worker = struct {
+        stop: *const bool,
+
+        fn run(ctx: *@This(), tid: usize) void {
+            const seed64: u64 = 0x9E3779B9 ^ (@as(u64, tid) * 0x85EBCA6B);
+            var x: u32 = @truncate(seed64);
+            var i: usize = 0;
+            while (!@atomicLoad(bool, ctx.stop, .acquire) and i < 20_000) : (i += 1) {
+                // xorshift32
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                const tag: u32 = 0x5400_0000 | (x & 0x00FF_FFFF);
+                noteAlloc(tag, 8);
+            }
+        }
+    };
+
+    var stop: bool = false;
+    var worker: Worker = .{ .stop = &stop };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, tid| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &worker, tid });
+    }
+
+    // Try to take a few consistent snapshots while writers are active.
+    var snapshots: usize = 0;
+    while (snapshots < 8) : (snapshots += 1) {
+        var tries: usize = 0;
+        while (tries < 10_000) : (tries += 1) {
+            const seq0 = @atomicLoad(u64, &g_tagalloc_registry.publish_seq, .acquire);
+            if ((seq0 & 1) != 0) continue;
+
+            const first = @atomicLoad(usize, &g_tagalloc_registry.first_segment, .acquire);
+            if (first == 0) return error.TestUnexpectedResult;
+
+            var seg_addr: usize = first;
+            var seg_count: usize = 0;
+            while (seg_addr != 0) : (seg_count += 1) {
+                if (seg_count > 128) return error.TestUnexpectedResult;
+                const seg: *AggSegmentV1 = @ptrFromInt(seg_addr);
+
+                const entry_stride: usize = @intCast(seg.entry_stride);
+                const entry_count: usize = @intCast(seg.entry_count);
+                if (entry_stride < @sizeOf(AggEntryV1)) return error.TestUnexpectedResult;
+                if (entry_count == 0) return error.TestUnexpectedResult;
+
+                const bytes_needed = try std.math.mul(usize, entry_stride, entry_count);
+                const expected_min = @sizeOf(AggSegmentV1) + bytes_needed;
+                if (seg.segment_size < expected_min) return error.TestUnexpectedResult;
+
+                seg_addr = @atomicLoad(usize, &seg.next_segment, .acquire);
+            }
+
+            const seq1 = @atomicLoad(u64, &g_tagalloc_registry.publish_seq, .acquire);
+            if (seq0 != seq1) continue;
+
+            // Consistent snapshot.
+            break;
+        }
+    }
+
+    @atomicStore(bool, &stop, true, .release);
+    for (threads) |t| t.join();
+}

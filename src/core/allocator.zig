@@ -338,6 +338,23 @@ test "aligned alloc returns properly aligned pointer" {
         const min_align = defaultAlign();
         try std.testing.expect((@intFromPtr(p) % min_align) == 0);
     }
+
+    {
+        // Large alignment (page-scale). This should either succeed and return a
+        // correctly aligned pointer, or fail with OOM (not InvalidAlignment).
+        const page = os.pageSize();
+        try std.testing.expect(std.math.isPowerOfTwo(page));
+
+        const big_align = page * 2;
+        try std.testing.expect(std.math.isPowerOfTwo(big_align));
+
+        const p = alignedAlloc(tag, 17, big_align) catch |err| switch (err) {
+            error.OutOfMemory => return,
+            else => return err,
+        };
+        defer free(p);
+        try std.testing.expect((@intFromPtr(p) % big_align) == 0);
+    }
 }
 
 test "freeWithExpectedTag mismatch bumps registry counter" {
