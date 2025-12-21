@@ -17,6 +17,7 @@ const AllocHeader = extern struct {
     backing_base: usize,
     backing_len: usize,
     user_size: usize,
+    agg_entry_addr: usize, // *registry.AggEntryV1 (cached for fast free accounting)
     tag: u32,
     align_log2: u8,
     kind: u8,
@@ -96,6 +97,8 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
 
     registry.ensureInit();
 
+    const agg_entry = registry.getOrInsertAggEntry(tag);
+
     const hdr_size = @sizeOf(AllocHeader);
     const prefix_size = @sizeOf(usize);
     const effective_alignment = try normalizeAlignment(alignment);
@@ -119,6 +122,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                     .backing_base = 0,
                     .backing_len = class_size,
                     .user_size = size,
+                    .agg_entry_addr = @intFromPtr(agg_entry),
                     .tag = tag,
                     .align_log2 = @intCast(@ctz(effective_alignment)),
                     .kind = HDR_KIND_SLAB,
@@ -134,7 +138,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                 const user_ptr: [*]u8 = @ptrFromInt(user_addr);
                 hardening.poisonAlloc(user_ptr, size);
                 hardening.writeTailCanary(user_ptr, size);
-                registry.noteAlloc(tag, size);
+                registry.noteAllocEntry(agg_entry, size);
                 return user_ptr;
             }
         }
@@ -158,6 +162,8 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
     var user_ptr: [*]u8 = undefined;
     var used_arena = false;
 
+    const agg_entry = registry.getOrInsertAggEntry(tag);
+
     if (arena_order) |ord| blk: {
         // If arena init fails, fall back to mmap-per-allocation.
         if (!g_arena.tryInit()) break :blk;
@@ -169,6 +175,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
             .backing_base = g_arena.base,
             .backing_len = arena.ArenaSize,
             .user_size = size,
+            .agg_entry_addr = @intFromPtr(agg_entry),
             .tag = tag,
             .align_log2 = @intCast(@ctz(effective_alignment)),
             .kind = HDR_KIND_ARENA,
@@ -202,6 +209,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
             .backing_base = base_addr,
             .backing_len = map_len,
             .user_size = size,
+            .agg_entry_addr = @intFromPtr(agg_entry),
             .tag = tag,
             .align_log2 = @intCast(@ctz(effective_alignment)),
             .kind = HDR_KIND_MMAP,
@@ -219,7 +227,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
         hardening.writeTailCanary(user_ptr, size);
     }
 
-    registry.noteAlloc(tag, size);
+    registry.noteAllocEntry(agg_entry, size);
 
     return user_ptr;
 }
@@ -240,7 +248,12 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
         }
     }
 
-    registry.noteFree(hdr.tag, hdr.user_size);
+    if (hdr.agg_entry_addr != 0) {
+        const entry: *registry.AggEntryV1 = @ptrFromInt(hdr.agg_entry_addr);
+        registry.noteFreeEntry(entry, hdr.user_size);
+    } else {
+        registry.noteFree(hdr.tag, hdr.user_size);
+    }
 
     if (hardening.enabled()) {
         if (hdr.reserved0 == HDR_STATE_FREED) {

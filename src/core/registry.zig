@@ -135,6 +135,19 @@ fn bumpFree(entry: *AggEntryV1, size: usize) void {
     atomicAddSaturating(&entry.free_bytes, @intCast(size));
 }
 
+pub fn getOrInsertAggEntry(tag: u32) *AggEntryV1 {
+    ensureInit();
+    return findOrInsertEntry(tag);
+}
+
+pub fn noteAllocEntry(entry: *AggEntryV1, size: usize) void {
+    bumpAlloc(entry, size);
+}
+
+pub fn noteFreeEntry(entry: *AggEntryV1, size: usize) void {
+    bumpFree(entry, size);
+}
+
 fn segmentEntriesPtr(seg: *AggSegmentV1) [*]AggEntryV1 {
     const base = @intFromPtr(seg) + @sizeOf(AggSegmentV1);
     return @ptrFromInt(base);
