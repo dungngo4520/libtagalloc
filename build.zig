@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
         test_mod.addImport("abi", abi_mod);
 
         const poolreader_lib_mod = b.createModule(.{
-            .root_source_file = b.path("tools/poolreader_lib.zig"),
+            .root_source_file = b.path("tools/poolreader/lib.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const poolreader_step = b.step("poolreader", "Build poolreader");
     {
         const mod = b.createModule(.{
-            .root_source_file = b.path("tools/poolreader.zig"),
+            .root_source_file = b.path("tools/poolreader/main.zig"),
             .target = target,
             .optimize = optimize,
         });

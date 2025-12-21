@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Linux = @import("os_linux.zig");
+const Windows = @import("os_windows.zig");
+const Macos = @import("os_macos.zig");
 
 const Unsupported = struct {
     pub fn pageSize() usize {
@@ -17,6 +19,8 @@ const Unsupported = struct {
 
 const Impl = switch (builtin.os.tag) {
     .linux => Linux,
+    .windows => Windows,
+    .macos => Macos,
     else => Unsupported,
 };
 

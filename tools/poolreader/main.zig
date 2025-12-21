@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const abi = @import("abi");
-const pr = @import("poolreader_lib.zig");
+const pr = @import("lib.zig");
 
 pub fn main() void {
     run() catch |err| {
@@ -13,8 +13,6 @@ pub fn main() void {
 }
 
 fn run() !void {
-    if (builtin.os.tag != .linux) return error.Unsupported;
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -45,7 +43,9 @@ fn run() !void {
     };
     defer pr.freeMaps(allocator, maps);
 
-    const registry_addr = if (parsed.allow_scan)
+    const use_scan = parsed.allow_scan or builtin.os.tag != .linux;
+
+    const registry_addr = if (use_scan)
         findRegistryAddrScanFallback(allocator, pid, maps) catch |err| {
             const stderr = std.fs.File.stderr();
             try reportCommonError(stderr, pid, err);
