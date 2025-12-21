@@ -1,10 +1,10 @@
 const builtin = @import("builtin");
 
 const Impl = switch (builtin.os.tag) {
-    .linux => @import("platform_linux.zig"),
-    .windows => @import("platform_windows.zig"),
-    .macos => @import("platform_macos.zig"),
-    else => @import("platform_unsupported.zig"),
+    .linux => @import("linux.zig"),
+    .windows => @import("windows.zig"),
+    .macos => @import("macos.zig"),
+    else => @import("unsupported.zig"),
 };
 
 pub const MapEntry = Impl.MapEntry;

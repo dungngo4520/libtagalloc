@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const os = @import("../platform/os.zig");
+const os = @import("../platform/platform.zig");
 const arena = @import("arena.zig");
 const slab = @import("slab.zig");
 const registry = @import("registry.zig");

@@ -1,21 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Linux = @import("os_linux.zig");
-const Windows = @import("os_windows.zig");
-const Macos = @import("os_macos.zig");
-
-const Unsupported = struct {
-    pub fn pageSize() usize {
-        return std.heap.pageSize();
-    }
-
-    pub fn osMmap(_: usize) ![*]u8 {
-        return error.Unsupported;
-    }
-
-    pub fn osMunmap(_: [*]u8, _: usize) void {}
-};
+const Linux = @import("linux.zig");
+const Windows = @import("windows.zig");
+const Macos = @import("macos.zig");
+const Unsupported = @import("unsupported.zig");
 
 const Impl = switch (builtin.os.tag) {
     .linux => Linux,

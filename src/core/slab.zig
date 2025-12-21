@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const os = @import("../platform/os.zig");
+const os = @import("../platform/platform.zig");
 
 // Slab allocator for fixed-size hot paths
 // Design: Per-size-class pools with per-thread magazines for lock-free fast path

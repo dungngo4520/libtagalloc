@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const abi = @import("abi");
-const os = @import("../platform/os.zig");
+const os = @import("../platform/platform.zig");
 
 pub const TAGALLOC_ABI_VERSION = abi.TAGALLOC_ABI_VERSION;
 pub const TAGALLOC_REGISTRY_MAGIC = abi.TAGALLOC_REGISTRY_MAGIC;

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const abi = @import("abi");
-const platform = @import("platform.zig");
+const platform = @import("platform/platform.zig");
 
 pub const ENTRY_USED: u32 = 1;
 
