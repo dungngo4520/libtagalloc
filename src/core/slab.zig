@@ -5,14 +5,16 @@ const os = @import("../platform/os.zig");
 // Slab allocator for fixed-size hot paths
 // Design: Per-size-class pools with per-thread magazines for lock-free fast path
 //
-// Size classes: 16, 32, 64, 128, 256, 512 bytes (6 classes)
+// Size classes: 16, 32, 64, 128, 256, 512, 1024 bytes.
+// Note: allocator metadata (header/prefix/canary) consumes some bytes, so
+// having a 1024B class keeps 512B user allocations eligible for slab.
 // Each slab is one OS page containing fixed-size slots
 // Slabs are organized in per-class pools with a free list
 //
 // Performance goal: O(1) allocation/free with no locks on the fast path (per-thread cache hit)
 // Fallback: When thread cache misses, take a central lock to refill/flush
 
-pub const SlabSizeClasses = [_]usize{ 16, 32, 64, 128, 256, 512 };
+pub const SlabSizeClasses = [_]usize{ 16, 32, 64, 128, 256, 512, 1024 };
 pub const SlabClassCount: usize = SlabSizeClasses.len;
 
 const ThreadCacheCapacity: usize = 64;
@@ -335,7 +337,9 @@ test "sizeToClassIndex maps correctly" {
     try std.testing.expectEqual(@as(?usize, 1), sizeToClassIndex(32));
     try std.testing.expectEqual(@as(?usize, 2), sizeToClassIndex(33));
     try std.testing.expectEqual(@as(?usize, 5), sizeToClassIndex(512));
-    try std.testing.expectEqual(@as(?usize, null), sizeToClassIndex(513));
+    try std.testing.expectEqual(@as(?usize, 6), sizeToClassIndex(513));
+    try std.testing.expectEqual(@as(?usize, 6), sizeToClassIndex(1024));
+    try std.testing.expectEqual(@as(?usize, null), sizeToClassIndex(1025));
     try std.testing.expectEqual(@as(?usize, null), sizeToClassIndex(0));
 }
 
