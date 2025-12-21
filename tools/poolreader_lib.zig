@@ -339,6 +339,88 @@ pub fn readTagStats(pid: i32, first_segment: usize, tag: u32) !?TagStats {
     return null;
 }
 
+test "poolreader registry header validation rejects wrong magic/version" {
+    var reg: abi.RegistryV1 = .{
+        .magic = abi.TAGALLOC_REGISTRY_MAGIC,
+        .abi_version = abi.TAGALLOC_ABI_VERSION,
+        .header_size = @intCast(@sizeOf(abi.RegistryV1)),
+        .ptr_size = @intCast(@sizeOf(usize)),
+        .endianness = 1,
+        .reserved0 = 0,
+        .publish_seq = 0,
+        .flags = 0,
+        .first_segment = 0,
+        .overflow_tag = 0,
+        .reserved1 = 0,
+        .tag_mismatch_count = 0,
+        .dropped_tag_count = 0,
+    };
+
+    try validateRegistryHeader(reg);
+
+    reg.magic ^= 1;
+    try std.testing.expectError(error.BadMagic, validateRegistryHeader(reg));
+    reg.magic = abi.TAGALLOC_REGISTRY_MAGIC;
+
+    reg.abi_version += 1;
+    try std.testing.expectError(error.BadAbiVersion, validateRegistryHeader(reg));
+}
+
+test "poolreader registry header validation rejects bad sizes/endianness" {
+    var reg: abi.RegistryV1 = .{
+        .magic = abi.TAGALLOC_REGISTRY_MAGIC,
+        .abi_version = abi.TAGALLOC_ABI_VERSION,
+        .header_size = @intCast(@sizeOf(abi.RegistryV1)),
+        .ptr_size = @intCast(@sizeOf(usize)),
+        .endianness = 1,
+        .reserved0 = 0,
+        .publish_seq = 0,
+        .flags = 0,
+        .first_segment = 0,
+        .overflow_tag = 0,
+        .reserved1 = 0,
+        .tag_mismatch_count = 0,
+        .dropped_tag_count = 0,
+    };
+
+    reg.header_size = 0;
+    try std.testing.expectError(error.BadHeaderSize, validateRegistryHeader(reg));
+    reg.header_size = @intCast(@sizeOf(abi.RegistryV1));
+
+    reg.ptr_size = 0;
+    try std.testing.expectError(error.BadPtrSize, validateRegistryHeader(reg));
+    reg.ptr_size = @intCast(@sizeOf(usize));
+
+    reg.endianness = 2;
+    try std.testing.expectError(error.BadEndianness, validateRegistryHeader(reg));
+}
+
+test "poolreader segment header validation rejects bad stride/size" {
+    const entry_size: usize = @sizeOf(abi.AggEntryV1);
+
+    var seg: abi.AggSegmentV1 = .{
+        .segment_size = 0,
+        .entry_stride = @intCast(entry_size),
+        .entry_count = 1,
+        .next_segment = 0,
+        .reserved0 = 0,
+    };
+
+    // Too small for header + one entry.
+    seg.segment_size = @intCast(@sizeOf(abi.AggSegmentV1));
+    try std.testing.expectError(error.BadSegmentSize, validateAggSegmentHeader(seg));
+
+    // Stride too small.
+    seg.segment_size = @intCast(@sizeOf(abi.AggSegmentV1) + entry_size);
+    seg.entry_stride = @intCast(entry_size - 1);
+    try std.testing.expectError(error.BadEntryStride, validateAggSegmentHeader(seg));
+
+    // Entry count must be non-zero.
+    seg.entry_stride = @intCast(entry_size);
+    seg.entry_count = 0;
+    try std.testing.expectError(error.BadEntryCount, validateAggSegmentHeader(seg));
+}
+
 fn readRemoteU64(pid: i32, addr: usize) !u64 {
     var buf: [8]u8 = undefined;
     try processVmRead(pid, addr, buf[0..]);

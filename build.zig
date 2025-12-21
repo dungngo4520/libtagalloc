@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
         });
         test_mod.addImport("abi", abi_mod);
 
+        const poolreader_lib_mod = b.createModule(.{
+            .root_source_file = b.path("tools/poolreader_lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        poolreader_lib_mod.addImport("abi", abi_mod);
+        test_mod.addImport("poolreader_lib", poolreader_lib_mod);
+
         const unit_tests = b.addTest(.{ .root_module = test_mod });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
