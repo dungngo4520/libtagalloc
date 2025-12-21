@@ -4,7 +4,15 @@ const builtin = @import("builtin");
 const abi = @import("abi");
 const pr = @import("poolreader_lib.zig");
 
-pub fn main() !void {
+pub fn main() void {
+    run() catch |err| {
+        const stderr = std.fs.File.stderr();
+        reportFatal(stderr, err) catch {};
+        std.process.exit(1);
+    };
+}
+
+fn run() !void {
     if (builtin.os.tag != .linux) return error.Unsupported;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -14,53 +22,70 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const parsed = try parseArgs(args);
+    const parsed = parseArgs(args) catch |err| {
+        const stderr = std.fs.File.stderr();
+        try reportArgsError(stderr, args[0], err);
+        return;
+    };
     if (parsed.show_help) {
-        try fprint(std.fs.File.stderr(), "usage: {s} <pid> [--scan] [--watch] [--interval-ms N]\n", .{args[0]});
-        try fprint(std.fs.File.stderr(), "  --scan           allow bounded RW mapping scan fallback (opt-in)\n", .{});
-        try fprint(std.fs.File.stderr(), "  --watch          constantly watching (Ctrl-C to quit)\n", .{});
-        try fprint(std.fs.File.stderr(), "  --interval-ms N  watch refresh period (default: 1000)\n", .{});
+        const stderr = std.fs.File.stderr();
+        try fprint(stderr, "usage: {s} <pid> [--scan] [--watch] [--interval-ms N]\n", .{args[0]});
+        try fprint(stderr, "  --scan           allow bounded RW mapping scan fallback (opt-in)\n", .{});
+        try fprint(stderr, "  --watch          constantly watching (Ctrl-C to quit)\n", .{});
+        try fprint(stderr, "  --interval-ms N  watch refresh period (default: 1000)\n", .{});
         return;
     }
 
     const pid: i32 = parsed.pid;
 
     const maps = pr.readMaps(allocator, pid) catch |err| {
-        try reportCommonError(std.fs.File.stderr(), pid, err);
-        return err;
+        const stderr = std.fs.File.stderr();
+        try reportCommonError(stderr, pid, err);
+        return;
     };
     defer pr.freeMaps(allocator, maps);
 
     const registry_addr = if (parsed.allow_scan)
         findRegistryAddrScanFallback(allocator, pid, maps) catch |err| {
-            try reportCommonError(std.fs.File.stderr(), pid, err);
-            return err;
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
         }
     else
         pr.findRegistryAddr(allocator, pid, maps) catch |err| {
-            try reportCommonError(std.fs.File.stderr(), pid, err);
-            return err;
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
         };
 
     const stdout = std.fs.File.stdout();
 
     if (!parsed.watch) {
-        const reg = try pr.readRegistryStable(pid, registry_addr);
+        const reg = pr.readRegistryStable(pid, registry_addr) catch |err| {
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
+        };
         try fprint(
             stdout,
             "registry=0x{x} abi=v{d} flags=0x{x} seq={d}\n",
             .{ registry_addr, reg.abi_version, reg.flags, reg.publish_seq },
         );
-        try dumpSegments(pid, reg.first_segment, stdout);
+        dumpSegments(pid, reg.first_segment, stdout) catch |err| {
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
+        };
         return;
     }
 
     // Minimal top-like loop: clear + redraw until Ctrl-C.
     const interval_ns: u64 = parsed.interval_ms * std.time.ns_per_ms;
     while (true) {
-        const reg = pr.readRegistryStable(pid, registry_addr) catch |err| switch (err) {
-            error.NoSuchProcess => return error.NoSuchProcess,
-            else => return err,
+        const reg = pr.readRegistryStable(pid, registry_addr) catch |err| {
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
         };
 
         // ANSI clear screen + home.
@@ -72,10 +97,31 @@ pub fn main() !void {
             "tagalloc-poolreader pid={d} t={d}ms\nregistry=0x{x} abi=v{d} flags=0x{x} seq={d}\n\n",
             .{ pid, now_ms, registry_addr, reg.abi_version, reg.flags, reg.publish_seq },
         );
-        try dumpSegments(pid, reg.first_segment, stdout);
+        dumpSegments(pid, reg.first_segment, stdout) catch |err| {
+            const stderr = std.fs.File.stderr();
+            try reportCommonError(stderr, pid, err);
+            return;
+        };
         try stdout.writeAll("\n");
 
         std.Thread.sleep(interval_ns);
+    }
+}
+
+fn reportArgsError(stderr: std.fs.File, argv0: []const u8, err: anyerror) !void {
+    switch (err) {
+        error.InvalidArgs => {
+            try fprint(stderr, "error: invalid arguments\n", .{});
+            try fprint(stderr, "usage: {s} <pid> [--scan] [--watch] [--interval-ms N]\n", .{argv0});
+        },
+        else => try reportFatal(stderr, err),
+    }
+}
+
+fn reportFatal(stderr: std.fs.File, err: anyerror) !void {
+    switch (err) {
+        error.Unsupported => try fprint(stderr, "error: unsupported platform\n", .{}),
+        else => try fprint(stderr, "error: {s}\n", .{@errorName(err)}),
     }
 }
 
