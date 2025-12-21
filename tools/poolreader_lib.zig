@@ -211,11 +211,7 @@ fn findRegistryAddrInModuleBySymbol(
         else => return null,
     };
 
-    if (reg.magic != abi.TAGALLOC_REGISTRY_MAGIC) return null;
-    if (reg.abi_version != abi.TAGALLOC_ABI_VERSION) return null;
-    if (reg.header_size < @sizeOf(abi.RegistryV1)) return null;
-    if (reg.ptr_size != @sizeOf(usize)) return null;
-    if (reg.endianness != 1) return null;
+    validateRegistryHeader(reg) catch return null;
 
     return remote_addr;
 }
@@ -271,6 +267,26 @@ pub fn readRegistryStable(pid: i32, addr: usize) !abi.RegistryV1 {
     return error.UnstableRegistry;
 }
 
+pub fn validateRegistryHeader(reg: abi.RegistryV1) !void {
+    if (reg.magic != abi.TAGALLOC_REGISTRY_MAGIC) return error.BadMagic;
+    if (reg.abi_version != abi.TAGALLOC_ABI_VERSION) return error.BadAbiVersion;
+    if (reg.header_size < @sizeOf(abi.RegistryV1)) return error.BadHeaderSize;
+    if (reg.ptr_size != @sizeOf(usize)) return error.BadPtrSize;
+    if (reg.endianness != 1) return error.BadEndianness;
+}
+
+pub fn validateAggSegmentHeader(seg: abi.AggSegmentV1) !void {
+    const entry_stride: usize = @intCast(seg.entry_stride);
+    const entry_count: usize = @intCast(seg.entry_count);
+
+    if (entry_count == 0) return error.BadEntryCount;
+    if (entry_stride < @sizeOf(abi.AggEntryV1)) return error.BadEntryStride;
+
+    const bytes_needed = try std.math.mul(usize, entry_stride, entry_count);
+    const expected_min = @sizeOf(abi.AggSegmentV1) + bytes_needed;
+    if (seg.segment_size < expected_min) return error.BadSegmentSize;
+}
+
 pub const TagStats = struct {
     tag: u32,
     alloc_count: u64,
@@ -285,14 +301,12 @@ pub fn readTagStats(pid: i32, first_segment: usize, tag: u32) !?TagStats {
     while (seg_addr != 0) {
         const seg = try readRemoteType(pid, seg_addr, abi.AggSegmentV1);
 
+        try validateAggSegmentHeader(seg);
+
         const entry_stride: usize = @intCast(seg.entry_stride);
         const entry_count: usize = @intCast(seg.entry_count);
 
-        if (entry_stride < @sizeOf(abi.AggEntryV1)) return error.BadEntryStride;
-
         const bytes_needed = try std.math.mul(usize, entry_stride, entry_count);
-        const expected_min = @sizeOf(abi.AggSegmentV1) + bytes_needed;
-        if (seg.segment_size < expected_min) return error.BadSegmentSize;
 
         var entries = try std.heap.page_allocator.alloc(u8, bytes_needed);
         defer std.heap.page_allocator.free(entries);
