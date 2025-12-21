@@ -94,4 +94,26 @@ pub fn build(b: *std.Build) void {
         demo_cpp.linkLibrary(tagalloc_lib);
         demo_step.dependOn(&b.addInstallArtifact(demo_cpp, .{}).step);
     }
+
+    // Benchmarks.
+    const bench_step = b.step("benchmark", "Build benchmarks");
+    {
+        const bench_slab_mod = b.createModule(.{
+            .root_source_file = b.path("benchmark/bench_slab.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        bench_slab_mod.addImport("tagalloc", root_mod);
+        const bench_slab = b.addExecutable(.{ .name = "tagalloc-bench-slab", .root_module = bench_slab_mod });
+        bench_step.dependOn(&b.addInstallArtifact(bench_slab, .{}).step);
+
+        const stress_mod = b.createModule(.{
+            .root_source_file = b.path("benchmark/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        stress_mod.addImport("tagalloc", root_mod);
+        const stress = b.addExecutable(.{ .name = "tagalloc-stress", .root_module = stress_mod });
+        bench_step.dependOn(&b.addInstallArtifact(stress, .{}).step);
+    }
 }
