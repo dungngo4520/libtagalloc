@@ -13,16 +13,22 @@ fn defaultAlign() usize {
     return if (@sizeOf(usize) == 8) DefaultAlign64 else DefaultAlign32;
 }
 
-const AllocHeader = extern struct {
-    backing_base: usize,
-    backing_len: usize,
+// Keep a small header for slab allocations to reduce allocation overhead.
+// Larger allocations use a header that carries information for mmap.
+const HeaderBase = extern struct {
     user_size: usize,
     agg_entry_addr: usize, // *registry.AggEntryV1 (cached for fast free accounting)
     tag: u32,
     align_log2: u8,
     kind: u8,
     arena_order: u8,
-    reserved0: u8,
+    state: u8,
+};
+
+const HeaderFull = extern struct {
+    base: HeaderBase,
+    backing_base: usize,
+    backing_len: usize,
 };
 
 const HDR_KIND_MMAP: u8 = 0;
@@ -99,13 +105,13 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
 
     const agg_entry = registry.getOrInsertAggEntry(tag);
 
-    const hdr_size = @sizeOf(AllocHeader);
+    const slab_hdr_size = @sizeOf(HeaderBase);
     const prefix_size = @sizeOf(usize);
     const effective_alignment = try normalizeAlignment(alignment);
     const tail_bytes = hardening.tailBytes();
 
     if (alignment == 0 or effective_alignment <= defaultAlign()) {
-        const user_off = std.mem.alignForward(usize, hdr_size + prefix_size, effective_alignment);
+        const user_off = std.mem.alignForward(usize, slab_hdr_size + prefix_size, effective_alignment);
         const overhead = try std.math.add(usize, user_off, tail_bytes);
         const total_needed = try std.math.add(usize, size, overhead);
         if (slab.sizeToClassIndex(total_needed)) |class_idx| {
@@ -117,23 +123,21 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                 };
 
                 const hdr_addr = @intFromPtr(slot);
-                const hdr: *AllocHeader = @ptrFromInt(hdr_addr);
+                const hdr: *HeaderBase = @ptrFromInt(hdr_addr);
                 hdr.* = .{
-                    .backing_base = 0,
-                    .backing_len = class_size,
                     .user_size = size,
                     .agg_entry_addr = @intFromPtr(agg_entry),
                     .tag = tag,
                     .align_log2 = @intCast(@ctz(effective_alignment)),
                     .kind = HDR_KIND_SLAB,
                     .arena_order = 0,
-                    .reserved0 = HDR_STATE_LIVE,
+                    .state = HDR_STATE_LIVE,
                 };
 
                 const user_addr = hdr_addr + user_off;
                 const prefix_addr = user_addr - prefix_size;
                 const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
-                prefix_ptr.* = @intFromPtr(hdr);
+                prefix_ptr.* = hdr_addr;
 
                 const user_ptr: [*]u8 = @ptrFromInt(user_addr);
                 hardening.poisonAlloc(user_ptr, size);
@@ -148,7 +152,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
 }
 
 fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
-    const hdr_size = @sizeOf(AllocHeader);
+    const hdr_size = @sizeOf(HeaderFull);
     const prefix_size = @sizeOf(usize);
 
     var raw_needed = try std.math.add(usize, hdr_size, prefix_size);
@@ -158,7 +162,7 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
 
     const arena_order = arena.sizeToArenaOrder(raw_needed);
 
-    var hdr: *AllocHeader = undefined;
+    var hdr: *HeaderFull = undefined;
     var user_ptr: [*]u8 = undefined;
     var used_arena = false;
 
@@ -172,22 +176,24 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
         const hdr_addr = block_addr; // block base
         hdr = @ptrFromInt(hdr_addr);
         hdr.* = .{
-            .backing_base = g_arena.base,
-            .backing_len = arena.ArenaSize,
-            .user_size = size,
-            .agg_entry_addr = @intFromPtr(agg_entry),
-            .tag = tag,
-            .align_log2 = @intCast(@ctz(effective_alignment)),
-            .kind = HDR_KIND_ARENA,
-            .arena_order = ord,
-            .reserved0 = HDR_STATE_LIVE,
+            .base = .{
+                .user_size = size,
+                .agg_entry_addr = @intFromPtr(agg_entry),
+                .tag = tag,
+                .align_log2 = @intCast(@ctz(effective_alignment)),
+                .kind = HDR_KIND_ARENA,
+                .arena_order = ord,
+                .state = HDR_STATE_LIVE,
+            },
+            .backing_base = 0,
+            .backing_len = 0,
         };
 
         const after_hdr = hdr_addr + hdr_size;
         const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
         const prefix_addr = user_addr - prefix_size;
         const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
-        prefix_ptr.* = @intFromPtr(hdr);
+        prefix_ptr.* = hdr_addr;
         user_ptr = @ptrFromInt(user_addr);
         hardening.poisonAlloc(user_ptr, size);
         hardening.writeTailCanary(user_ptr, size);
@@ -206,22 +212,24 @@ fn allocFallback(tag: u32, size: usize, effective_alignment: usize) ![*]u8 {
 
         hdr = @ptrFromInt(hdr_addr);
         hdr.* = .{
+            .base = .{
+                .user_size = size,
+                .agg_entry_addr = @intFromPtr(agg_entry),
+                .tag = tag,
+                .align_log2 = @intCast(@ctz(effective_alignment)),
+                .kind = HDR_KIND_MMAP,
+                .arena_order = 0,
+                .state = HDR_STATE_LIVE,
+            },
             .backing_base = base_addr,
             .backing_len = map_len,
-            .user_size = size,
-            .agg_entry_addr = @intFromPtr(agg_entry),
-            .tag = tag,
-            .align_log2 = @intCast(@ctz(effective_alignment)),
-            .kind = HDR_KIND_MMAP,
-            .arena_order = 0,
-            .reserved0 = HDR_STATE_LIVE,
         };
 
         const after_hdr = hdr_addr + hdr_size;
         const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
         const prefix_addr = user_addr - prefix_size;
         const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
-        prefix_ptr.* = @intFromPtr(hdr);
+        prefix_ptr.* = hdr_addr;
         user_ptr = @ptrFromInt(user_addr);
         hardening.poisonAlloc(user_ptr, size);
         hardening.writeTailCanary(user_ptr, size);
@@ -240,7 +248,7 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
     const prefix_size = @sizeOf(usize);
     const prefix_addr = @intFromPtr(ptr) - prefix_size;
     const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
-    const hdr: *AllocHeader = @ptrFromInt(hdr_addr);
+    const hdr: *HeaderBase = @ptrFromInt(hdr_addr);
 
     if (expected_tag) |exp| {
         if (hdr.tag != exp) {
@@ -256,20 +264,23 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
     }
 
     if (hardening.enabled()) {
-        if (hdr.reserved0 == HDR_STATE_FREED) {
+        if (hdr.state == HDR_STATE_FREED) {
             hardening.hardPanic("tagalloc: double free detected");
         }
         if (!hardening.checkTailCanary(ptr, hdr.user_size)) {
             hardening.hardPanic("tagalloc: tail canary corrupted (buffer overrun)");
         }
         hardening.poisonFree(ptr, hdr.user_size);
-        hdr.reserved0 = HDR_STATE_FREED;
+        hdr.state = HDR_STATE_FREED;
+
+        const backing_base: usize = if (hdr.kind == HDR_KIND_MMAP) @as(*const HeaderFull, @ptrFromInt(hdr_addr)).backing_base else 0;
+        const backing_len: usize = if (hdr.kind == HDR_KIND_MMAP) @as(*const HeaderFull, @ptrFromInt(hdr_addr)).backing_len else 0;
 
         quarantinePush(.{
             .kind = hdr.kind,
             .hdr_addr = hdr_addr,
-            .backing_base = hdr.backing_base,
-            .backing_len = hdr.backing_len,
+            .backing_base = backing_base,
+            .backing_len = backing_len,
             .arena_order = hdr.arena_order,
             .user_ptr = ptr,
             .user_size = hdr.user_size,
@@ -277,11 +288,14 @@ fn freeInternal(ptr: [*]u8, expected_tag: ?u32) void {
         return;
     }
 
+    const backing_base: usize = if (hdr.kind == HDR_KIND_MMAP) @as(*const HeaderFull, @ptrFromInt(hdr_addr)).backing_base else 0;
+    const backing_len: usize = if (hdr.kind == HDR_KIND_MMAP) @as(*const HeaderFull, @ptrFromInt(hdr_addr)).backing_len else 0;
+
     actuallyFree(.{
         .kind = hdr.kind,
         .hdr_addr = hdr_addr,
-        .backing_base = hdr.backing_base,
-        .backing_len = hdr.backing_len,
+        .backing_base = backing_base,
+        .backing_len = backing_len,
         .arena_order = hdr.arena_order,
         .user_ptr = ptr,
         .user_size = hdr.user_size,
@@ -316,7 +330,7 @@ pub fn realloc(tag: u32, ptr: ?[*]u8, new_size: usize) ![*]u8 {
     const prefix_size = @sizeOf(usize);
     const prefix_addr = @intFromPtr(old_ptr) - prefix_size;
     const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
-    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+    const hdr: *const HeaderBase = @ptrFromInt(hdr_addr);
 
     const old_size = hdr.user_size;
     const alignment: usize = @as(usize, 1) << @as(u6, @intCast(hdr.align_log2));
@@ -416,7 +430,7 @@ test "non-slab allocations use arena backing when available" {
     const prefix_size = @sizeOf(usize);
     const prefix_addr = @intFromPtr(p) - prefix_size;
     const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
-    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+    const hdr: *const HeaderBase = @ptrFromInt(hdr_addr);
 
     // Either arena or mmap is acceptable if arena init fails in the test environment.
     try std.testing.expect(hdr.kind == HDR_KIND_ARENA or hdr.kind == HDR_KIND_MMAP);
@@ -430,7 +444,7 @@ test "small allocations use slab backing when eligible" {
     const prefix_size = @sizeOf(usize);
     const prefix_addr = @intFromPtr(p) - prefix_size;
     const hdr_addr = (@as(*const usize, @ptrFromInt(prefix_addr))).*;
-    const hdr: *const AllocHeader = @ptrFromInt(hdr_addr);
+    const hdr: *const HeaderBase = @ptrFromInt(hdr_addr);
 
     try std.testing.expectEqual(HDR_KIND_SLAB, hdr.kind);
 }
