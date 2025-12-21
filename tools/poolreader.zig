@@ -325,10 +325,12 @@ fn dumpSegments(pid: i32, first: usize, out: std.fs.File) !void {
             if (entry.reserved0 != pr.ENTRY_USED) continue;
 
             const tag_ascii = abi.tagToAscii(entry.tag);
+            const diff: i128 = @as(i128, @intCast(entry.alloc_count)) - @as(i128, @intCast(entry.free_count));
+            const diff_bytes: i128 = @as(i128, @intCast(entry.alloc_bytes)) - @as(i128, @intCast(entry.free_bytes));
             try fprint(
                 out,
-                "{s} alloc={d} bytes={d} free={d} bytes={d}\n",
-                .{ tag_ascii[0..], entry.alloc_count, entry.alloc_bytes, entry.free_count, entry.free_bytes },
+                "{s} alloc={d} bytes={d} free={d} bytes={d} diff={d} diff_bytes={d}\n",
+                .{ tag_ascii[0..], entry.alloc_count, entry.alloc_bytes, entry.free_count, entry.free_bytes, diff, diff_bytes },
             );
         }
 
