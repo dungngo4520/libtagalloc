@@ -31,24 +31,28 @@ pub fn sizeToClassIndex(size: usize) ?usize {
 
 // Slab metadata header (stored at the start of each slab page)
 pub const SlabHeader = struct {
+    const FreeBitmapWords: usize = 16; // 16*64 = 1024 slots max per slab page
+
     class_index: u8,
     slot_size: u16,
     slot_count: u16,
     free_count: u16, // number of free slots in this slab
     next_slab: ?*SlabHeader, // next slab in pool free list
-    free_bitmap: [64]u64, // bitmap for up to 4096 slots (more than enough for one page)
+    free_bitmap: [FreeBitmapWords]u64, // bitmap for up to FreeBitmapWords*64 slots
 
     fn init(class_index: u8, slot_size: usize) SlabHeader {
         const page = os.pageSize();
         const usable = page - @sizeOf(SlabHeader);
-        const slots: u16 = @intCast(usable / slot_size);
+        const max_slots: usize = FreeBitmapWords * 64;
+        const computed_slots: usize = usable / slot_size;
+        const slots: u16 = @intCast(@min(computed_slots, max_slots));
         return .{
             .class_index = class_index,
             .slot_size = @intCast(slot_size),
             .slot_count = slots,
             .free_count = slots,
             .next_slab = null,
-            .free_bitmap = [_]u64{std.math.maxInt(u64)} ** 64,
+            .free_bitmap = [_]u64{std.math.maxInt(u64)} ** FreeBitmapWords,
         };
     }
 
