@@ -65,6 +65,15 @@ pub fn build(b: *std.Build) void {
         const demo_zig = b.addExecutable(.{ .name = "tagalloc-demo-zig", .root_module = demo_zig_mod });
         demo_step.dependOn(&b.addInstallArtifact(demo_zig, .{}).step);
 
+        const quickstart_mod = b.createModule(.{
+            .root_source_file = b.path("examples/quickstart.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        quickstart_mod.addImport("tagalloc", root_mod);
+        const quickstart = b.addExecutable(.{ .name = "tagalloc-quickstart", .root_module = quickstart_mod });
+        demo_step.dependOn(&b.addInstallArtifact(quickstart, .{}).step);
+
         const demo_cpp_mod = b.createModule(.{
             .root_source_file = null,
             .target = target,
