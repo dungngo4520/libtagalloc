@@ -102,7 +102,8 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
     const tail_bytes = hardening.tailBytes();
 
     if (alignment == 0 or effective_alignment <= defaultAlign()) {
-        const overhead = hdr_size + prefix_size + tail_bytes;
+        const user_off = std.mem.alignForward(usize, hdr_size + prefix_size, effective_alignment);
+        const overhead = try std.math.add(usize, user_off, tail_bytes);
         const total_needed = try std.math.add(usize, size, overhead);
         if (slab.sizeToClassIndex(total_needed)) |class_idx| {
             const class_size = slab.SlabSizeClasses[class_idx];
@@ -125,8 +126,7 @@ fn allocInternal(tag: u32, size: usize, alignment: usize) ![*]u8 {
                     .reserved0 = HDR_STATE_LIVE,
                 };
 
-                const after_hdr = hdr_addr + hdr_size;
-                const user_addr = std.mem.alignForward(usize, after_hdr + prefix_size, effective_alignment);
+                const user_addr = hdr_addr + user_off;
                 const prefix_addr = user_addr - prefix_size;
                 const prefix_ptr: *usize = @ptrFromInt(prefix_addr);
                 prefix_ptr.* = @intFromPtr(hdr);
