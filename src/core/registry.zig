@@ -48,6 +48,9 @@ var g_base_segment: BaseSegment = .{
 
 var g_tag_table_lock: std.Thread.Mutex = .{};
 
+// 0 = not initialized, 1 = initializing, 2 = initialized
+var g_init_state: u8 = 0;
+
 pub export var g_tagalloc_registry: RegistryV1 = .{
     .magic = TAGALLOC_REGISTRY_MAGIC,
     .abi_version = TAGALLOC_ABI_VERSION,
@@ -79,11 +82,23 @@ fn isLittleEndian() bool {
 }
 
 pub fn ensureInit() void {
-    // Keep this idempotent and cheap; called on entrypoints.
-    g_tagalloc_registry.endianness = if (isLittleEndian()) 1 else 2;
-    g_tagalloc_registry.ptr_size = @intCast(@sizeOf(usize));
-    g_tagalloc_registry.header_size = @intCast(@sizeOf(RegistryV1));
-    g_tagalloc_registry.first_segment = @intFromPtr(&g_base_segment.header);
+    // Called on hot paths; keep this cheap.
+    if (@atomicLoad(u8, &g_init_state, .acquire) == 2) return;
+
+    if (@cmpxchgStrong(u8, &g_init_state, 0, 1, .acq_rel, .acquire) == null) {
+        // Winner initializes invariant fields.
+        g_tagalloc_registry.endianness = if (isLittleEndian()) 1 else 2;
+        g_tagalloc_registry.ptr_size = @intCast(@sizeOf(usize));
+        g_tagalloc_registry.header_size = @intCast(@sizeOf(RegistryV1));
+        g_tagalloc_registry.first_segment = @intFromPtr(&g_base_segment.header);
+        @atomicStore(u8, &g_init_state, 2, .release);
+        return;
+    }
+
+    // Someone else is initializing; wait until done.
+    while (@atomicLoad(u8, &g_init_state, .acquire) != 2) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 fn hashTag(tag: u32) usize {
@@ -400,4 +415,20 @@ test "per-tag counters bump" {
         try std.testing.expectEqual(before_free_count + 1, @atomicLoad(u64, &entry_after.free_count, .monotonic));
         try std.testing.expectEqual(before_free_bytes + 64, @atomicLoad(u64, &entry_after.free_bytes, .monotonic));
     }
+}
+
+test "counter overflow saturates and sets flag" {
+    const tag: u32 = 0x4F564552; // "REVO" in little-endian display order
+
+    ensureInit();
+    const entry = findOrInsertEntry(tag);
+
+    const near_max = std.math.maxInt(u64) - 1;
+    @atomicStore(u64, &entry.alloc_bytes, near_max, .monotonic);
+
+    noteAlloc(tag, 8);
+
+    try std.testing.expectEqual(std.math.maxInt(u64), @atomicLoad(u64, &entry.alloc_bytes, .monotonic));
+    const flags = @atomicLoad(u64, &g_tagalloc_registry.flags, .monotonic);
+    try std.testing.expect((flags & FLAG_COUNTER_OVERFLOW) != 0);
 }
