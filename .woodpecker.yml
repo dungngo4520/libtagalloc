@@ -178,7 +178,7 @@ steps:
 
           foreach ($zip in $candidates) {
             foreach ($mirror in $mirrors) {
-              $url = "$mirror/$zip`?source=libtagalloc-woodpecker"
+              $url = "$mirror/$zip?source=libtagalloc-woodpecker"
               try {
                 Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
                 $downloaded = $true
@@ -200,7 +200,7 @@ steps:
         if (Get-Command zig -ErrorAction SilentlyContinue) {
           zig version
         } else {
-          $dir = Get-ChildItem -Directory .ci | Where-Object { $_.Name -like "zig*${env:ZIG_VERSION}*" } | Select-Object -First 1
+          $dir = Get-ChildItem -Directory .ci | Where-Object { $_.Name -like "zig*$env:ZIG_VERSION*" } | Select-Object -First 1
           if ($null -eq $dir) { throw "Zig not found after download" }
           $env:PATH = $dir.FullName + ";" + $env:PATH
           zig version
