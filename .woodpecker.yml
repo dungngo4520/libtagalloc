@@ -1,0 +1,210 @@
+labels:
+  platform: linux/amd64
+
+when:
+  event: [push, pull_request]
+
+steps:
+  build_test:
+    name: build + test
+    image: bash
+    environment:
+      ZIG_VERSION: "0.15.0"
+    commands:
+      - set -euxo pipefail
+      - rm -rf zig-out zig-cache .ci || true
+      - mkdir -p .ci/bin
+      - |-
+        if command -v zig >/dev/null 2>&1; then
+          echo "zig already installed: $(zig version)"
+        else
+          # Mirrors serve: {mirror_url}/{tarball_basename}
+          # See: https://ziglang.org/download/community-mirrors/
+          MIRRORS=(
+            "https://ziglang.freetls.fastly.net"
+            "https://zig.linus.dev/zig"
+            "https://zig.florent.dev"
+            "https://pkg.earth/zig"
+            "https://pkg.machengine.org/zig"
+          )
+
+          TARBALLS=(
+            "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+            "zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          )
+
+          ok=0
+          for tarball in "${TARBALLS[@]}"; do
+            for mirror in "${MIRRORS[@]}"; do
+              url="${mirror}/${tarball}?source=libtagalloc-woodpecker"
+              if curl -fsSL "$url" -o .ci/zig.tar.xz; then
+                ok=1
+                break
+              fi
+            done
+            if [ "$ok" -eq 1 ]; then
+              break
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "Failed to download Zig ${ZIG_VERSION} from all mirrors" >&2
+            exit 1
+          fi
+
+          tar -xJf .ci/zig.tar.xz -C .ci
+          zig_dir="$(find .ci -maxdepth 1 -type d -name "zig*${ZIG_VERSION}*" -print | head -n 1)"
+          if [ -z "$zig_dir" ]; then
+            echo "Zig directory not found after extraction" >&2
+            exit 1
+          fi
+          mv "$zig_dir" .ci/zig
+          ln -sf "$PWD/.ci/zig/zig" .ci/bin/zig
+          export PATH="$PWD/.ci/bin:$PATH"
+          zig version
+        fi
+      - export PATH="$PWD/.ci/bin:$PATH"
+      - zig build --summary all
+      - zig build test --summary all
+
+---
+labels:
+  platform: darwin/amd64
+
+when:
+  event: [push, pull_request]
+
+steps:
+  build_test:
+    name: build + test
+    image: bash
+    environment:
+      ZIG_VERSION: "0.15.0"
+    commands:
+      - set -euxo pipefail
+      - rm -rf zig-out zig-cache .ci || true
+      - mkdir -p .ci/bin
+      - |-
+        if command -v zig >/dev/null 2>&1; then
+          echo "zig already installed: $(zig version)"
+        else
+          # Mirrors serve: {mirror_url}/{tarball_basename}
+          # See: https://ziglang.org/download/community-mirrors/
+          MIRRORS=(
+            "https://ziglang.freetls.fastly.net"
+            "https://zig.linus.dev/zig"
+            "https://zig.florent.dev"
+            "https://pkg.earth/zig"
+            "https://pkg.machengine.org/zig"
+          )
+
+          TARBALLS=(
+            "zig-x86_64-macos-${ZIG_VERSION}.tar.xz"
+            "zig-macos-x86_64-${ZIG_VERSION}.tar.xz"
+          )
+
+          ok=0
+          for tarball in "${TARBALLS[@]}"; do
+            for mirror in "${MIRRORS[@]}"; do
+              url="${mirror}/${tarball}?source=libtagalloc-woodpecker"
+              if curl -fsSL "$url" -o .ci/zig.tar.xz; then
+                ok=1
+                break
+              fi
+            done
+            if [ "$ok" -eq 1 ]; then
+              break
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "Failed to download Zig ${ZIG_VERSION} from all mirrors" >&2
+            exit 1
+          fi
+
+          tar -xJf .ci/zig.tar.xz -C .ci
+          zig_dir="$(find .ci -maxdepth 1 -type d -name "zig*${ZIG_VERSION}*" -print | head -n 1)"
+          if [ -z "$zig_dir" ]; then
+            echo "Zig directory not found after extraction" >&2
+            exit 1
+          fi
+          mv "$zig_dir" .ci/zig
+          ln -sf "$PWD/.ci/zig/zig" .ci/bin/zig
+          export PATH="$PWD/.ci/bin:$PATH"
+          zig version
+        fi
+      - export PATH="$PWD/.ci/bin:$PATH"
+      - zig build --summary all
+      - zig build test --summary all
+
+---
+labels:
+  platform: windows/amd64
+
+when:
+  event: [push, pull_request]
+
+steps:
+  build_test:
+    name: build + test
+    image: powershell
+    environment:
+      ZIG_VERSION: "0.15.0"
+    commands:
+      - |-
+        $ErrorActionPreference = 'Stop'
+
+        Remove-Item -Recurse -Force zig-out,zig-cache,.ci -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force .ci | Out-Null
+
+        if (-not (Get-Command zig -ErrorAction SilentlyContinue)) {
+          # Mirrors serve: {mirror_url}/{tarball_basename}
+          # See: https://ziglang.org/download/community-mirrors/
+          $mirrors = @(
+            'https://ziglang.freetls.fastly.net',
+            'https://zig.linus.dev/zig',
+            'https://zig.florent.dev',
+            'https://pkg.earth/zig',
+            'https://pkg.machengine.org/zig'
+          )
+
+          $candidates = @(
+            "zig-x86_64-windows-$env:ZIG_VERSION.zip",
+            "zig-windows-x86_64-$env:ZIG_VERSION.zip"
+          )
+
+          $out = Join-Path $PWD ".ci\\zig.zip"
+          $downloaded = $false
+
+          foreach ($zip in $candidates) {
+            foreach ($mirror in $mirrors) {
+              $url = "$mirror/$zip`?source=libtagalloc-woodpecker"
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+                $downloaded = $true
+                break
+              } catch {
+                # try next mirror
+              }
+            }
+            if ($downloaded) { break }
+          }
+
+          if (-not $downloaded) {
+            throw "Failed to download Zig $env:ZIG_VERSION from all mirrors"
+          }
+
+          Expand-Archive -Path $out -DestinationPath (Join-Path $PWD ".ci") -Force
+        }
+
+        if (Get-Command zig -ErrorAction SilentlyContinue) {
+          zig version
+        } else {
+          $dir = Get-ChildItem -Directory .ci | Where-Object { $_.Name -like "zig*${env:ZIG_VERSION}*" } | Select-Object -First 1
+          if ($null -eq $dir) { throw "Zig not found after download" }
+          $env:PATH = $dir.FullName + ";" + $env:PATH
+          zig version
+        }
+
+        zig build --summary all
+        zig build test --summary all
